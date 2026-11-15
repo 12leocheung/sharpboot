@@ -29,7 +29,7 @@ export const MAX_STRING_BYTES = GLOBAL_START - STRING_START;
 
 import { FONT_8X8 } from './graphics.ts';
 
-const FONT_LINES = Array.from({ length: FONT_8X8.length / 16 }, (_, row) =>
+const FONT_LINES = Array.from({ length: Math.ceil(FONT_8X8.length / 16) }, (_, row) =>
   `  db ${FONT_8X8.slice(row * 16, row * 16 + 16).map((byte) => `0x${byte.toString(16).padStart(2, '0')}`).join(',')}`,
 ).join('\n');
 
@@ -42,7 +42,8 @@ STACK_LOW    equ 0x6000
 HEAP_BASE    equ 0x8000
 HEAP_MAX     equ 0xF000
 HEAP_SIZE    equ 0x7000
-GC_ROOTS     equ 7
+BACK_SEG     equ 0x2000
+GC_ROOTS     equ 8
 
 OP_HALT      equ 0
 OP_PUSHI     equ 1
@@ -104,7 +105,15 @@ OP_ASET      equ 56
 OP_GPALETTE  equ 57
 OP_GSPRITE   equ 58
 OP_GTEXT     equ 59
-OP_COUNT     equ 60
+OP_GBEGIN    equ 60
+OP_GPRESENT  equ 61
+OP_GENDBUF   equ 62
+OP_GSPRITESCALE equ 63
+OP_GSPRITEROT equ 64
+OP_GPALETTEPRESET equ 65
+OP_GSETFONT  equ 66
+OP_ACOPY     equ 67
+OP_COUNT     equ 68
 
 ; ---------------------------------------------------------------- entry
 start:
@@ -1545,7 +1554,11 @@ gfx_init:
   mov ax, 0x0013
   int 0x10
   mov ax, 0xA000
+  mov [gfx_seg], ax
   mov es, ax
+  mov ax, font_data
+  mov [gfx_font], ax
+  mov word [gfx_font_owner], 0
   mov byte [gfx_on], 1
   call gfx_palette
   xor al, al
@@ -1610,13 +1623,122 @@ ensure_gfx:
 ensure_gfx_done:
   ret
 
+; Off-screen EGA/VGA buffer at 0x2000:0000. Present copies it to A000:0000.
+gfx_begin_buffer:
+  push ax
+  mov ax, BACK_SEG
+  mov [gfx_seg], ax
+  mov es, ax
+  xor al, al
+  call gfx_clear_raw
+  pop ax
+  ret
+
+gfx_present:
+  push ax
+  push cx
+  push si
+  push di
+  push es
+  push ds
+  mov ax, BACK_SEG
+  mov ds, ax
+  mov ax, 0xA000
+  mov es, ax
+  xor si, si
+  xor di, di
+  mov cx, 64000
+  cld
+  rep movsb
+  pop ds
+  pop es
+  pop di
+  pop si
+  pop cx
+  pop ax
+  ret
+
+gfx_end_buffer:
+  mov word [gfx_seg], 0xA000
+  mov ax, 0xA000
+  mov es, ax
+  ret
+
+gfx_palette_preset:
+  cmp ax, 1
+  je gfx_preset_gray
+  cmp ax, 2
+  je gfx_preset_sunset
+  call gfx_palette
+  ret
+gfx_preset_gray:
+  push ax
+  push bx
+  push cx
+  push dx
+  mov word [gfx_pal_i], 0
+gfx_preset_gray_loop:
+  mov bx, [gfx_pal_i]
+  mov dl, bl
+  shr dl, 1
+  shr dl, 1
+  mov dh, dl
+  mov ch, dl
+  mov cl, dl
+  mov ax, 0x1010
+  int 0x10
+  inc word [gfx_pal_i]
+  cmp word [gfx_pal_i], 256
+  jb gfx_preset_gray_loop
+  pop dx
+  pop cx
+  pop bx
+  pop ax
+  ret
+gfx_preset_sunset:
+  push ax
+  push bx
+  push cx
+  push dx
+  mov word [gfx_pal_i], 0
+gfx_preset_sunset_loop:
+  mov bx, [gfx_pal_i]
+  mov dl, bl
+  shr dl, 1
+  shr dl, 1
+  mov dh, dl
+  mov ch, bl
+  shr ch, 1
+  shr ch, 1
+  shr ch, 1
+  mov cl, 255
+  sub cl, bl
+  shr cl, 1
+  shr cl, 1
+  mov ax, 0x1010
+  int 0x10
+  inc word [gfx_pal_i]
+  cmp word [gfx_pal_i], 256
+  jb gfx_preset_sunset_loop
+  pop dx
+  pop cx
+  pop bx
+  pop ax
+  ret
+
 gfx_clear_raw:
   push cx
   push di
+  push es
+  push ax
+  mov ax, [gfx_seg]
+  mov es, ax
+  pop ax
   xor di, di
   mov cx, 64000
   cld
   rep stosb
+  pop es
   pop di
   pop cx
   ret
@@ -1625,6 +1747,7 @@ gfx_end:
   cmp byte [gfx_on], 0
   je gfx_end_done
   mov byte [gfx_on], 0
+  mov word [gfx_seg], 0xA000
   mov ax, 0x0003
   int 0x10
   mov ax, VGA
@@ -1649,6 +1772,9 @@ gfx_setpixel:
   push cx
   push dx
   push di
+  push es
+  mov dx, [gfx_seg]
+  mov es, dx
   push ax
   mov ax, bx
   mov dx, 320
@@ -1658,6 +1784,7 @@ gfx_setpixel:
   add di, ax
   mov al, cl
   stosb
+  pop es
   pop di
   pop dx
   pop cx
@@ -1693,6 +1820,11 @@ gfx_hl_wok:
   push bx
   push dx
   push di
+  push es
+  push ax
+  mov ax, [gfx_seg]
+  mov es, ax
+  pop ax
   push ax
   mov di, bx
   shl di, 1
@@ -1708,6 +1840,7 @@ gfx_hl_wok:
   add di, ax
   mov al, dl
   rep stosb
+  pop es
   pop di
   pop dx
   pop bx
@@ -1742,6 +1875,11 @@ gfx_vl_hok:
   push bx
   push dx
   push di
+  push es
+  push ax
+  mov ax, [gfx_seg]
+  mov es, ax
+  pop ax
   push ax
   mov di, bx
   shl di, 1
@@ -1761,6 +1899,7 @@ gfx_vl_loop:
   add di, 319
   dec cx
   jnz gfx_vl_loop
+  pop es
   pop di
   pop dx
   pop bx
@@ -2291,6 +2430,84 @@ op_aset:
   call push_val
   jmp run
 
+op_acopy:
+  call pop_val
+  mov [tmp_len], dx
+  call pop_val
+  mov [tmp_dst], dx
+  call pop_val
+  cmp al, 3
+  jne fault_array
+  mov [tmp_ptr], dx
+  call pop_val
+  mov [a_val], dx
+  call pop_val
+  cmp al, 3
+  jne fault_array
+  mov [b_val], dx
+  mov ax, [tmp_len]
+  test ax, ax
+  js fault_array
+  mov bx, [b_val]
+  mov cx, [a_val]
+  test cx, cx
+  js fault_array
+  mov dx, cx
+  add dx, ax
+  cmp dx, [bx]
+  ja fault_array
+  mov bx, [tmp_ptr]
+  mov cx, [tmp_dst]
+  test cx, cx
+  js fault_array
+  mov dx, cx
+  add dx, ax
+  cmp dx, [bx]
+  ja fault_array
+  push si
+  push di
+  push es
+  mov si, [a_val]
+  shl si, 1
+  shl si, 1
+  add si, 2
+  add si, [b_val]
+  mov di, [tmp_dst]
+  shl di, 1
+  shl di, 1
+  add di, 2
+  add di, [tmp_ptr]
+  mov cx, [tmp_len]
+  shl cx, 1
+  push ds
+  pop es
+  test cx, cx
+  jz op_acopy_forward
+  cmp di, si
+  jbe op_acopy_forward
+  mov ax, cx
+  shl ax, 1
+  add ax, si
+  cmp di, ax
+  jae op_acopy_forward
+  mov ax, cx
+  dec ax
+  shl ax, 1
+  add si, ax
+  add di, ax
+  std
+  rep movsw
+  cld
+  jmp op_acopy_done
+op_acopy_forward:
+  cld
+  rep movsw
+op_acopy_done:
+  pop es
+  pop di
+  pop si
+  jmp run
+
 op_gpalette:
   call pop_val
   mov [gfx_b], dl
@@ -2352,6 +2569,100 @@ op_gtext:
   call gfx_text
   jmp run
 op_gtext_bad:
+  mov di, msg_type
+  call warn
+  jmp run
+
+op_gbegin:
+  call ensure_gfx
+  call gfx_begin_buffer
+  jmp run
+
+op_gpresent:
+  call gfx_present
+  jmp run
+
+op_gendbuf:
+  call gfx_end_buffer
+  jmp run
+
+op_gpalettepreset:
+  call ensure_gfx
+  call pop_val
+  mov ax, dx
+  call gfx_palette_preset
+  jmp run
+
+op_gsetfont:
+  call ensure_gfx
+  call pop_val
+  cmp al, 1
+  jne op_gsetfont_bad
+  mov bx, dx
+  cmp word [bx], 760
+  jb op_gsetfont_bad
+  mov [gfx_font_owner], dx
+  add dx, 2
+  mov [gfx_font], dx
+  jmp run
+op_gsetfont_bad:
+  mov di, msg_font
+  call warn
+  jmp run
+
+op_gsprscale:
+  call ensure_gfx
+  call pop_val
+  mov [gfx_scale], dx
+  call pop_val
+  mov [gfx_h], dx
+  call pop_val
+  mov [gfx_w], dx
+  call pop_val
+  cmp al, 1
+  jne op_gsprscale_bad
+  mov [gfx_src], dx
+  call pop_val
+  mov [gfx_y], dx
+  call pop_val
+  mov [gfx_x], dx
+  cmp word [gfx_scale], 0
+  jle op_gsprscale_bad
+  cmp word [gfx_scale], 8
+  jg op_gsprscale_bad
+  call gfx_sprite_scale
+  jmp run
+op_gsprscale_bad:
+  mov di, msg_type
+  call warn
+  jmp run
+
+op_gsprrot:
+  call ensure_gfx
+  call pop_val
+  mov ax, dx
+  and ax, 3
+  mov [gfx_rot], ax
+  call pop_val
+  mov [gfx_h], dx
+  call pop_val
+  mov [gfx_w], dx
+  call pop_val
+  cmp al, 1
+  jne op_gsprrot_bad
+  mov [gfx_src], dx
+  call pop_val
+  mov [gfx_y], dx
+  call pop_val
+  mov [gfx_x], dx
+  cmp word [gfx_rot], 0
+  je op_gsprrot_normal
+  call gfx_sprite_rot
+  jmp run
+op_gsprrot_normal:
+  call gfx_sprite
+  jmp run
+op_gsprrot_bad:
   mov di, msg_type
   call warn
   jmp run
@@ -2423,15 +2734,9 @@ gfx_text_char:
 gfx_text_not_nl:
   cmp al, 13
   je gfx_text_char
-  cmp al, 'a'
-  jb gfx_text_upper_done
-  cmp al, 'z'
-  ja gfx_text_upper_done
-  sub al, 32
-gfx_text_upper_done:
   cmp al, 32
   jb gfx_text_badglyph
-  cmp al, 95
+  cmp al, 126
   jbe gfx_text_glyph
 gfx_text_badglyph:
   mov al, '?'
@@ -2441,7 +2746,7 @@ gfx_text_glyph:
   shl ax, 1
   shl ax, 1
   shl ax, 1
-  add ax, font_data
+  add ax, [gfx_font]
   mov [gfx_glyph], ax
   mov word [gfx_row], 0
 gfx_text_row:
@@ -2550,6 +2855,217 @@ gfx_sprite_done:
   pop ax
   ret
 
+; AL=character -> AL=palette color or 0xFF for transparent
+gfx_sprite_color:
+  cmp al, 32
+  je gfx_sprite_color_clear
+  cmp al, '.'
+  je gfx_sprite_color_clear
+  mov ah, al
+  cmp al, '0'
+  jb gfx_sprite_color_other
+  cmp al, '9'
+  ja gfx_sprite_color_alpha
+  sub al, '0'
+  ret
+gfx_sprite_color_alpha:
+  cmp al, 'A'
+  jb gfx_sprite_color_lower
+  cmp al, 'F'
+  ja gfx_sprite_color_lower
+  sub al, 'A' - 10
+  ret
+gfx_sprite_color_lower:
+  cmp al, 'a'
+  jb gfx_sprite_color_other
+  cmp al, 'f'
+  ja gfx_sprite_color_other
+  sub al, 'a' - 10
+  ret
+gfx_sprite_color_other:
+  mov al, ah
+  ret
+gfx_sprite_color_clear:
+  mov al, 0xFF
+  ret
+
+gfx_sprite_scale:
+  push ax
+  push bx
+  push cx
+  push dx
+  push si
+  push di
+  mov si, [gfx_src]
+  mov ax, [si]
+  mov [gfx_len], ax
+  add si, 2
+  mov word [gfx_row], 0
+gfx_ss_row:
+  mov ax, [gfx_row]
+  cmp ax, [gfx_h]
+  jae gfx_ss_done
+  mov word [gfx_col], 0
+gfx_ss_col:
+  mov ax, [gfx_col]
+  cmp ax, [gfx_w]
+  jae gfx_ss_next_row
+  cmp word [gfx_len], 0
+  je gfx_ss_done
+  mov al, [si]
+  inc si
+  dec word [gfx_len]
+  call gfx_sprite_color
+  cmp al, 0xFF
+  je gfx_ss_skip
+  mov [gfx_color], al
+  mov word [gfx_ry], 0
+gfx_ss_ry:
+  mov ax, [gfx_ry]
+  cmp ax, [gfx_scale]
+  jae gfx_ss_skip
+  mov word [gfx_rx], 0
+gfx_ss_rx:
+  mov ax, [gfx_rx]
+  cmp ax, [gfx_scale]
+  jae gfx_ss_next_ry
+  mov cx, [gfx_scale]
+  mov ax, [gfx_col]
+  mul cx
+  add ax, [gfx_x]
+  add ax, [gfx_rx]
+  mov ax, [gfx_row]
+  mul cx
+  ; DX:AX is row*scale; keep the low word
+  add ax, [gfx_y]
+  add ax, [gfx_ry]
+  mov bx, ax
+  mov ax, [gfx_col]
+  mov cx, [gfx_scale]
+  mul cx
+  add ax, [gfx_x]
+  add ax, [gfx_rx]
+  mov cl, [gfx_color]
+  call gfx_setpixel
+  inc word [gfx_rx]
+  jmp gfx_ss_rx
+gfx_ss_next_ry:
+  inc word [gfx_ry]
+  jmp gfx_ss_ry
+gfx_ss_skip:
+  inc word [gfx_col]
+  jmp gfx_ss_col
+gfx_ss_next_row:
+  inc word [gfx_row]
+  jmp gfx_ss_row
+gfx_ss_done:
+  pop di
+  pop si
+  pop dx
+  pop cx
+  pop bx
+  pop ax
+  ret
+
+gfx_sprite_rot:
+  push ax
+  push bx
+  push cx
+  push dx
+  push si
+  push di
+  mov si, [gfx_src]
+  mov ax, [si]
+  mov [gfx_len], ax
+  mov ax, [gfx_rot]
+  and ax, 1
+  jz gfx_sr_even
+  mov ax, [gfx_h]
+  mov [gfx_dw], ax
+  mov ax, [gfx_w]
+  mov [gfx_dh], ax
+  jmp gfx_sr_start
+gfx_sr_even:
+  mov ax, [gfx_w]
+  mov [gfx_dw], ax
+  mov ax, [gfx_h]
+  mov [gfx_dh], ax
+gfx_sr_start:
+  mov word [gfx_row], 0
+gfx_sr_row:
+  mov ax, [gfx_row]
+  cmp ax, [gfx_dh]
+  jae gfx_sr_done
+  mov word [gfx_col], 0
+gfx_sr_col:
+  mov ax, [gfx_col]
+  cmp ax, [gfx_dw]
+  jae gfx_sr_next_row
+  mov ax, [gfx_rot]
+  cmp ax, 1
+  je gfx_sr_r1
+  cmp ax, 2
+  je gfx_sr_r2
+  ; 270 degrees
+  mov ax, [gfx_w]
+  dec ax
+  sub ax, [gfx_row]
+  mov [gfx_sx], ax
+  mov ax, [gfx_col]
+  mov [gfx_sy], ax
+  jmp gfx_sr_index
+gfx_sr_r1:
+  mov ax, [gfx_row]
+  mov [gfx_sx], ax
+  mov ax, [gfx_h]
+  dec ax
+  sub ax, [gfx_col]
+  mov [gfx_sy], ax
+  jmp gfx_sr_index
+gfx_sr_r2:
+  mov ax, [gfx_w]
+  dec ax
+  sub ax, [gfx_col]
+  mov [gfx_sx], ax
+  mov ax, [gfx_h]
+  dec ax
+  sub ax, [gfx_row]
+  mov [gfx_sy], ax
+gfx_sr_index:
+  mov ax, [gfx_sy]
+  mov cx, [gfx_w]
+  mul cx
+  add ax, [gfx_sx]
+  cmp ax, [gfx_len]
+  jae gfx_sr_skip
+  add ax, [gfx_src]
+  add ax, 2
+  mov bx, ax
+  mov al, [bx]
+  call gfx_sprite_color
+  cmp al, 0xFF
+  je gfx_sr_skip
+  mov cl, al
+  mov ax, [gfx_x]
+  add ax, [gfx_col]
+  mov bx, [gfx_y]
+  add bx, [gfx_row]
+  call gfx_setpixel
+gfx_sr_skip:
+  inc word [gfx_col]
+  jmp gfx_sr_col
+gfx_sr_next_row:
+  inc word [gfx_row]
+  jmp gfx_sr_row
+gfx_sr_done:
+  pop di
+  pop si
+  pop dx
+  pop cx
+  pop bx
+  pop ax
+  ret
+
 ; ---------------------------------------------------------------- dispatch table
 jt:
   dw op_halt, op_pushi, op_pushs, op_load, op_store, op_loadg, op_storeg
@@ -2563,6 +3079,8 @@ jt:
   dw op_ginit, op_gend, op_gclear, op_gpixel, op_gfillrect
   dw op_grect, op_gline, op_gfillcircle, op_gcircle, op_rgb
   dw op_newarr, op_aget, op_aset, op_gpalette, op_gsprite, op_gtext
+  dw op_gbegin, op_gpresent, op_gendbuf, op_gsprscale, op_gsprrot
+  dw op_gpalettepreset, op_gsetfont, op_acopy
 
 ; ---------------------------------------------------------------- data
 row:        dw 0
@@ -2572,7 +3090,7 @@ cur_attr:   db 0x0F
 vsp:        dw 0
 heap:       dw 0
 gc_retry:   db 0
-gc_roots:   dw a_val, b_val, c_val, tmp_ptr, tmp_dst, in_ptr, pv_val
+gc_roots:   dw a_val, b_val, c_val, tmp_ptr, tmp_dst, in_ptr, pv_val, gfx_font_owner
 a_type:     db 0
 a_val:      dw 0
 a_len:      dw 0
@@ -2598,6 +3116,18 @@ in_len:     dw 0
 in_ptr:     dw 0
 gfx_on:     db 0
 gfx_pal_i:  dw 0
+gfx_seg:    dw 0xA000
+gfx_font:   dw 0
+gfx_font_owner: dw 0
+gfx_rot:    dw 0
+gfx_scale:  dw 1
+gfx_dw:     dw 0
+gfx_dh:     dw 0
+gfx_sx:     dw 0
+gfx_sy:     dw 0
+gfx_color:  db 0
+gfx_ry:     dw 0
+gfx_rx:     dw 0
 gfx_r:      db 0
 gfx_g:      db 0
 gfx_b:      db 0
@@ -2643,6 +3173,7 @@ msg_strord: msg "\n[repair] string ordering is unsupported -> false\n"
 msg_esc:    msg "\n[halted by ESC]\n"
 msg_oom:    msg "\n[fatal] heap exhausted\n"
 msg_arr:    msg "\n[fatal] array index or allocation error\n"
+msg_font:   msg "\n[repair] custom font needs 760 bytes -> ignored\n"
 msg_stack:  msg "\n[fatal] VM stack overflow\n"
 msg_code:   msg "\n[fatal] bytecode overrun\n"
 msg_op:     msg "\n[fatal] unknown opcode\n"

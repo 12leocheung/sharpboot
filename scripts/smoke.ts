@@ -241,6 +241,109 @@ if (arraysSample) {
   }
 }
 
+console.log('\n=== array initializers, foreach and Array.Copy on bare metal ===');
+const arrayFeatureSource = `using System;
+
+class Program
+{
+    static int Sum(int[] values)
+    {
+        int total = 0;
+        foreach (int value in values) total += value;
+        return total;
+    }
+
+    static void Main()
+    {
+        int[] numbers = new int[] { 3, 1, 4, 1, 5 };
+        Console.WriteLine("total=" + Sum(numbers));
+        double[] ratios = new double[] { 1, 2, 3 };
+        Console.WriteLine("ratios=" + ratios[0] + ratios[2]);
+        char[] letters = new char[] { 'a', 'b', 'c' };
+        Console.WriteLine("letters=" + letters[0] + letters[1] + letters[2]);
+        string[] copy = new string[3];
+        Array.Copy(new string[] { "x", "y", "z" }, 0, copy, 0, 3);
+        Console.WriteLine("copy=" + copy[0] + copy[1] + copy[2]);
+        int[] dest = new int[4];
+        Array.Copy(numbers, 1, dest, 1, 3);
+        Console.WriteLine("dest=" + dest[0] + "," + dest[1] + "," + dest[2] + "," + dest[3]);
+        string[] shift = new string[] { "a", "b", "c", "" };
+        Array.Copy(shift, 0, shift, 1, 3);
+        Console.WriteLine("shift=" + shift[0] + shift[1] + shift[2] + shift[3]);
+        int sum = 0;
+        foreach (int n in numbers)
+        {
+            if (n == 4) continue;
+            sum += n;
+        }
+        Console.WriteLine("foreach=" + sum);
+    }
+}
+`;
+const arrayFeature = compileProgram(arrayFeatureSource, 'array-features.cs');
+check(arrayFeature.ok, `array features failed to build: ${arrayFeature.diagnostics.map((d) => d.message).join('; ')}`);
+if (arrayFeature.image && arrayFeature.compiled) {
+  const hw = boot(arrayFeature, '');
+  check(hw.state === 'halted', 'array features did not halt');
+  for (const line of ['total=14', 'ratios=13', 'letters=abc', 'copy=xyz', 'dest=0,1,4,1', 'shift=aabc', 'foreach=10']) {
+    check(screenHas(hw.cpu, line), `array features: missing hardware output "${line}"`);
+  }
+  const vm = runVm(arrayFeature, [], []);
+  check(vm.state === 'halted', `array features: VM ended in ${vm.state}`);
+  compareScreens(hw.cpu, vm.vm, 'array features');
+  console.log('  initializers, double[]/char[] aliases, foreach and Array.Copy match the VM');
+}
+
+console.log('\n=== buffers, presets, transformed sprites and custom fonts ===');
+const customFont = 'A'.repeat(760);
+const graphicsFeatureSource = `using System;
+
+class Program
+{
+    static void Main()
+    {
+        Graphics.Init();
+        Graphics.BeginBuffer();
+        Graphics.PalettePreset(2);
+        Graphics.Clear(1);
+        Graphics.SpriteScaled(10, 10, "0123456789ABCDEF", 4, 4, 3);
+        Graphics.SpriteRotate(80, 10, "0123456789ABCDEF", 4, 4, 1);
+        Graphics.SetFont("${customFont}");
+        Graphics.Text(0, 150, "lowercase abc", 10);
+        Graphics.Present();
+        Graphics.EndBuffer();
+        int key = Console.ReadKey();
+        Graphics.End();
+        Console.WriteLine("gfx2 key=" + key);
+    }
+}
+`;
+const graphicsFeature = compileProgram(graphicsFeatureSource, 'graphics-features.cs');
+check(graphicsFeature.ok, `graphics features failed to build: ${graphicsFeature.diagnostics.map((d) => d.message).join('; ')}`);
+if (graphicsFeature.image && graphicsFeature.compiled) {
+  const hw = boot(graphicsFeature, '');
+  check(hw.state === 'waiting', 'graphics features did not wait for a key');
+  const vm = new BytecodeVm(graphicsFeature.compiled);
+  let vmState = vm.run();
+  check(vmState === 'waiting-key', `graphics features: VM ended in ${vmState} instead of waiting for a key`);
+  check(vm.palette()[0] === 0 && vm.palette()[1] === 0 && vm.palette()[2] === 255, 'graphics features: sunset palette preset was not applied');
+  compareGraphics(hw.cpu, vm, 'graphics features');
+
+  hw.cpu.pushKey('q'.charCodeAt(0));
+  try {
+    hw.cpu.run();
+  } catch (err) {
+    if (!(err instanceof Halted)) throw err;
+  }
+  vm.feedKey('q');
+  vmState = vm.run();
+  check(vmState === 'halted', `graphics features VM ended in ${vmState}`);
+  check(hw.cpu.videoMode === 0x03, 'graphics features: hardware did not return to text mode');
+  check(screenHas(hw.cpu, 'gfx2 key=113'), 'graphics features: key was not read');
+  compareScreens(hw.cpu, vm, 'graphics features after End()');
+  console.log('  double buffer, palette preset, scaled/rotated sprites and SetFont match the VM');
+}
+
 console.log('\n=== repair engine still feeds the linker ===');
 const repairSample = SAMPLES.find((sample) => sample.id === 'repair');
 check(Boolean(repairSample), 'repair sample is missing');

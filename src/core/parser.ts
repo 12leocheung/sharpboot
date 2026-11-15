@@ -47,6 +47,7 @@ export type Stmt =
   | { kind: 'while'; cond: Expr; body: Stmt[]; line: number }
   | { kind: 'do'; body: Stmt[]; cond: Expr; line: number }
   | { kind: 'for'; init?: Stmt; cond?: Expr; update?: Stmt; body: Stmt[]; line: number }
+  | { kind: 'foreach'; varName: string; varType: TypeName | null; iterable: Expr; body: Stmt[]; line: number }
   | { kind: 'break'; line: number }
   | { kind: 'continue'; line: number }
   | { kind: 'return'; value?: Expr; line: number }
@@ -70,6 +71,7 @@ export type Expr =
   | { kind: 'interp'; parts: (string | Expr)[]; line: number }
   | { kind: 'new'; typeName: TypeName; args: Expr[]; line: number }
   | { kind: 'newarray'; elementType: 'int' | 'string' | 'bool'; size: Expr; line: number }
+  | { kind: 'arrayinit'; elementType: 'int' | 'string' | 'bool'; items: Expr[]; line: number }
   | { kind: 'cast'; type: TypeName; expr: Expr; line: number };
 
 export interface ParseResult {
@@ -445,10 +447,8 @@ class Parser {
       const base = mapType(tok.value);
       if (base === 'int' || base === 'bool') return `${base}[]`;
       if (base === 'string' || base === 'char') return 'string[]';
-      if (base === 'double') {
-        this.fail('double arrays are not supported on bare metal', 'Use an int[] instead.');
-      }
-      this.fail(`Arrays of '${tok.value}' are not supported`, 'Use int[], string[], bool[] or char[].');
+      if (base === 'double') return 'int[]';
+      this.fail(`Arrays of '${tok.value}' are not supported`, 'Use int[], double[], string[], bool[] or char[].');
     }
     if (this.at('<')) {
       this.fail('Generic types are not supported', 'Use plain int, double, string, bool or char values.');
@@ -572,7 +572,19 @@ class Parser {
       this.fail('switch statements are not supported', 'Rewrite the switch as an if/else chain.');
     }
     if (this.at('foreach')) {
-      this.fail('foreach loops are not supported', 'Use a for loop over an index instead.');
+      this.next();
+      this.expect('(');
+      let varType: TypeName | null = null;
+      if (this.eat('var')) {
+        varType = null;
+      } else {
+        varType = this.parseType();
+      }
+      const varName = this.expectIdent().value;
+      this.expect('in');
+      const iterable = this.parseExpression();
+      this.expect(')');
+      return { kind: 'foreach', varName, varType, iterable, body: this.parseStatementAsBlock(), line };
     }
     if (this.at('try') || this.at('catch') || this.at('finally') || this.at('throw')) {
       this.fail('Exceptions are not supported', 'The kernel has no exception machinery — remove try/catch/throw.');
@@ -793,15 +805,28 @@ class Parser {
         this.next();
         if (this.at('[')) {
           this.next();
+          if (this.eat(']')) {
+            this.expect('{');
+            const items: Expr[] = [];
+            if (!this.at('}')) {
+              do {
+                items.push(this.parseExpression());
+              } while (this.eat(','));
+            }
+            this.expect('}');
+            const elementType = base === 'double' ? 'int' : base === 'char' ? 'string' : base;
+            if (elementType !== 'int' && elementType !== 'string' && elementType !== 'bool') {
+              this.fail(`new ${base}[] { ... } is not supported`);
+            }
+            return { kind: 'arrayinit', elementType, items, line: tok.line };
+          }
           const size = this.parseExpression();
           this.expect(']');
-          if (base === 'double') {
-            this.fail('double arrays are not supported on bare metal', 'Use an int[] instead.');
-          }
-          if (base !== 'int' && base !== 'string' && base !== 'bool') {
+          const elementType = base === 'double' ? 'int' : base === 'char' ? 'string' : base;
+          if (elementType !== 'int' && elementType !== 'string' && elementType !== 'bool') {
             this.fail(`new ${base}[...] is not supported`);
           }
-          return { kind: 'newarray', elementType: base, size, line: tok.line };
+          return { kind: 'newarray', elementType, size, line: tok.line };
         }
         if (base !== 'string') {
           this.fail('Only new string(...) and new int[n] are supported');

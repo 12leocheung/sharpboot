@@ -155,9 +155,12 @@
               <thead><tr><th>syntax</th><th>behavior</th></tr></thead>
               <tbody>
                 <tr><td><code>int[] a = new int[8];</code></td><td>Allocate eight int slots, initialized to <code>0</code>.</td></tr>
+                <tr><td><code>int[] a = new int[] { 3, 1, 4 };</code></td><td>Allocate and fill an array in one expression. Works for int, string, bool, double and char elements.</td></tr>
                 <tr><td><code>string[] names = new string[3];</code></td><td>Allocate three string slots, initialized to <code>""</code>.</td></tr>
+                <tr><td><code>foreach (int value in a)</code></td><td>Walk every element without maintaining an index. <code>break</code> and <code>continue</code> work inside the loop.</td></tr>
                 <tr><td><code>a[i]</code> / <code>a[i] = value</code></td><td>Bounds-checked indexing. Bad indexes stop with a runtime fault.</td></tr>
                 <tr><td><code>a.Length</code></td><td>Element count stored in the block header. Works for int, string and bool arrays.</td></tr>
+                <tr><td><code>Array.Copy(a, from, b, to, count)</code></td><td>Copy elements between arrays. Source and destination can be the same block.</td></tr>
                 <tr><td><code>void Fill(int[] values)</code></td><td>Arrays are reference values, so helper methods receive and mutate the same block.</td></tr>
               </tbody>
             </table>
@@ -166,7 +169,9 @@
                 header, and the allocator splits and coalesces free blocks. When contiguous space runs out it marks
                 roots and sweeps unreachable strings and arrays, then retries the allocation.</p>
               <p><strong>Limits.</strong> Arrays use two bytes per element plus a count word. An oversized allocation, a
-                negative size or an out-of-bounds index prints an array fault instead of corrupting the VM.</p>
+                negative size or an out-of-bounds index prints an array fault instead of corrupting the VM.
+                <code>double[]</code> is stored as <code>int[]</code> and <code>char[]</code> as <code>string[]</code>:
+                bare-metal SharpBoot has no floating-point or separate character runtime.</p>
               <p><strong>No collection pauses.</strong> Collection happens only when an allocation cannot be satisfied,
                 so a program that stays below the heap limit never pays for a sweep.</p>
             </div>
@@ -223,6 +228,8 @@ class Program
               <tbody>
                 <tr><td><code>Graphics.Init()</code></td><td>Enter 320×200 mode 13h and clear to black. Drawing calls auto-start graphics if you skip this.</td></tr>
                 <tr><td><code>Graphics.End()</code></td><td>Return to 80×25 text mode and clear the text screen.</td></tr>
+                <tr><td><code>Graphics.BeginBuffer()</code> / <code>Present()</code> / <code>EndBuffer()</code></td><td>Draw into an off-screen <code>2000:0000</code> buffer, then present the whole frame in one copy. This removes most tearing; call <code>EndBuffer()</code> to return to direct drawing.</td></tr>
+                <tr><td><code>Graphics.PalettePreset(0|1|2)</code></td><td>Select the default 3-3-2, grayscale or sunset palette.</td></tr>
                 <tr><td><code>Graphics.Rgb(r, g, b)</code></td><td>Pack 0–255 RGB into a palette index. Uses 3 bits red, 3 green, 2 blue.</td></tr>
                 <tr><td><code>Graphics.Width()</code> / <code>Height()</code></td><td>Return <code>320</code> and <code>200</code>.</td></tr>
                 <tr><td><code>Graphics.Clear(color)</code></td><td>Fill the whole framebuffer.</td></tr>
@@ -234,7 +241,10 @@ class Program
                 <tr><td><code>Graphics.Circle(cx, cy, r, color)</code></td><td>One-pixel circle outline.</td></tr>
                 <tr><td><code>Graphics.SetPalette(index, r, g, b)</code></td><td>Write one VGA DAC entry, 0–255 per channel. Call after <code>Init()</code>; the browser canvas uses the same palette.</td></tr>
                 <tr><td><code>Graphics.Sprite(x, y, rows, w, h)</code></td><td>Blit a string sprite. Space and <code>.</code> are transparent; <code>0–9</code> and <code>A–F</code> select palette entries 0–15.</td></tr>
-                <tr><td><code>Graphics.Text(x, y, text, color)</code></td><td>Draw an 8×8 bitmap-font string directly into the framebuffer. Lowercase is uppercased; unsupported glyphs become <code>?</code>.</td></tr>
+                <tr><td><code>Graphics.SpriteScaled(x, y, rows, w, h, scale)</code></td><td>Blit a sprite with each source pixel enlarged into a <code>scale × scale</code> block (1–8).</td></tr>
+                <tr><td><code>Graphics.SpriteRotate(x, y, rows, w, h, quarterTurns)</code></td><td>Rotate a sprite in 90° steps. The destination width and height swap on odd quarter turns.</td></tr>
+                <tr><td><code>Graphics.Text(x, y, text, color)</code></td><td>Draw an 8×8 bitmap-font string directly into the framebuffer. ASCII 32–126 is supported, including lowercase; unsupported glyphs become <code>?</code>.</td></tr>
+                <tr><td><code>Graphics.SetFont(table)</code></td><td>Replace the built-in font with a 760-character table (95 glyphs × 8 rows, bytes as characters).</td></tr>
               </tbody>
             </table>
             <div class="guide-notes">
@@ -245,7 +255,8 @@ class Program
                 <code>Console.ReadKey().KeyChar</code> still works for game input; <code>ReadLine</code> also reads input,
                 but its echo is not visible in graphics mode.</p>
               <p><strong>Drawing model.</strong> This is a direct framebuffer, not a retained scene or GPU API. Redraw what
-                you need each frame. There is no double buffer or vsync, so large animations may tear.</p>
+                you need each frame. Use <code>BeginBuffer()</code>/<code>Present()</code> for double buffering; there is
+                still no vsync, but presenting a completed buffer avoids most tearing.</p>
             </div>
           </div>
           <pre class="guide-code"><code>using System;

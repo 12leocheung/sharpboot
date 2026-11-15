@@ -8,7 +8,7 @@ import {
   GRAPHICS_HEIGHT,
   GRAPHICS_PIXELS,
   GRAPHICS_WIDTH,
-  paletteColor,
+  palettePresetColor,
   rgbIndex,
   spriteColor,
 } from './graphics.ts';
@@ -167,6 +167,9 @@ export class BytecodeVm {
   private screen = new VmScreen();
   private gfxMode = false;
   private gfx = new Uint8Array(GRAPHICS_PIXELS);
+  private back = new Uint8Array(GRAPHICS_PIXELS);
+  private buffered = false;
+  private fontBytes: number[] = FONT_8X8.slice();
   private paletteBytes = new Uint8Array(256 * 3);
   private slots: Val[] = [];
   private bp = 1024;
@@ -221,9 +224,9 @@ export class BytecodeVm {
     return this.paletteBytes;
   }
 
-  private resetPalette(): void {
+  private resetPalette(preset = 0): void {
     for (let index = 0; index < 256; index++) {
-      const [red, green, blue] = paletteColor(index);
+      const [red, green, blue] = palettePresetColor(preset, index);
       this.paletteBytes[index * 3] = red;
       this.paletteBytes[index * 3 + 1] = green;
       this.paletteBytes[index * 3 + 2] = blue;
@@ -231,6 +234,7 @@ export class BytecodeVm {
   }
 
   private gfxText(x: number, y: number, text: string, color: number): void {
+    // Font data is a custom 95-glyph table or the built-in ASCII 32..126 table.
     let cx = x;
     let cy = y;
     for (const raw of text) {
@@ -240,11 +244,11 @@ export class BytecodeVm {
         continue;
       }
       if (raw === '\r') continue;
-      let code = raw.toUpperCase().charCodeAt(0);
-      if (code < 32 || code > 95) code = 63;
+      let code = raw.charCodeAt(0);
+      if (code < 32 || code > 126) code = 63;
       const glyph = (code - 32) * 8;
       for (let row = 0; row < 8; row++) {
-        const bits = FONT_8X8[glyph + row] ?? 0;
+        const bits = this.fontBytes[glyph + row] ?? 0;
         for (let bit = 0; bit < 8; bit++) {
           if (bits & (0x80 >> bit)) this.gfxPixel(cx + bit, cy + row, color);
         }
@@ -265,6 +269,54 @@ export class BytecodeVm {
     }
   }
 
+  private gfxSpriteScale(x: number, y: number, data: string, width: number, height: number, scale: number): void {
+    if (width <= 0 || height <= 0 || scale <= 0 || scale > 8) return;
+    for (let row = 0; row < height; row++) {
+      for (let col = 0; col < width; col++) {
+        const ch = data.charAt(row * width + col);
+        if (!ch) return;
+        const color = spriteColor(ch);
+        if (color < 0) continue;
+        for (let ry = 0; ry < scale; ry++) {
+          for (let rx = 0; rx < scale; rx++) {
+            this.gfxPixel(x + col * scale + rx, y + row * scale + ry, color);
+          }
+        }
+      }
+    }
+  }
+
+  private gfxSpriteRotate(x: number, y: number, data: string, width: number, height: number, rotation: number): void {
+    if (width <= 0 || height <= 0) return;
+    const turn = ((rotation % 4) + 4) % 4;
+    if (turn === 0) {
+      this.gfxSprite(x, y, data, width, height);
+      return;
+    }
+    const dw = turn % 2 === 1 ? height : width;
+    const dh = turn % 2 === 1 ? width : height;
+    for (let dy = 0; dy < dh; dy++) {
+      for (let dx = 0; dx < dw; dx++) {
+        let sx = 0;
+        let sy = 0;
+        if (turn === 1) {
+          sx = dy;
+          sy = height - 1 - dx;
+        } else if (turn === 2) {
+          sx = width - 1 - dx;
+          sy = height - 1 - dy;
+        } else {
+          sx = width - 1 - dy;
+          sy = dx;
+        }
+        const index = sy * width + sx;
+        if (index < 0 || index >= data.length) continue;
+        const color = spriteColor(data.charAt(index));
+        if (color >= 0) this.gfxPixel(x + dx, y + dy, color);
+      }
+    }
+  }
+
   private writeText(text: string, attr = CP437_ATTR.normal): void {
     if (!this.gfxMode) this.screen.write(text, attr);
   }
@@ -276,12 +328,13 @@ export class BytecodeVm {
   }
 
   private gfxClear(color: number): void {
-    this.gfx.fill(color & 0xff);
+    (this.buffered ? this.back : this.gfx).fill(color & 0xff);
   }
 
   private gfxPixel(x: number, y: number, color: number): void {
     if (x < 0 || x >= GRAPHICS_WIDTH || y < 0 || y >= GRAPHICS_HEIGHT) return;
-    this.gfx[y * GRAPHICS_WIDTH + x] = color & 0xff;
+    const target = this.buffered ? this.back : this.gfx;
+    target[y * GRAPHICS_WIDTH + x] = color & 0xff;
   }
 
   private gfxHLine(x: number, y: number, w: number, color: number): void {
@@ -834,13 +887,46 @@ export class BytecodeVm {
       case Op.GINIT:
         this.gfxMode = true;
         this.gfx.fill(0);
+        this.buffered = false;
+        this.fontBytes = FONT_8X8.slice();
         this.resetPalette();
         return;
 
       case Op.GEND:
         this.gfxMode = false;
+        this.buffered = false;
         this.screen.clear();
         return;
+
+      case Op.GBEGIN:
+        this.gfxEnsure();
+        this.back.fill(0);
+        this.buffered = true;
+        return;
+
+      case Op.GPRESENT:
+        if (this.buffered) this.gfx.set(this.back);
+        return;
+
+      case Op.GENDBUF:
+        this.buffered = false;
+        return;
+
+      case Op.GPALETTEPRESET: {
+        const preset = toNum(this.pop());
+        this.resetPalette(preset);
+        return;
+      }
+
+      case Op.GSETFONT: {
+        const font = this.pop();
+        if (font.t !== 1 || font.v.length < 760) {
+          this.warn('custom font needs 760 characters -> ignored');
+          return;
+        }
+        this.fontBytes = Array.from(font.v.slice(0, 760)).map((ch) => ch.charCodeAt(0) & 0xff);
+        return;
+      }
 
       case Op.GCLEAR: {
         const color = toNum(this.pop());
@@ -958,6 +1044,57 @@ export class BytecodeVm {
         }
         this.gfxEnsure();
         this.gfxText(x, y, text.v, color);
+        return;
+      }
+
+      case Op.GSPRITESCALE: {
+        const scale = toNum(this.pop());
+        const height = toNum(this.pop());
+        const width = toNum(this.pop());
+        const data = this.pop();
+        const y = toNum(this.pop());
+        const x = toNum(this.pop());
+        if (data.t !== 1) {
+          this.warn('scaled sprite data is not a string -> skipped');
+          return;
+        }
+        this.gfxEnsure();
+        this.gfxSpriteScale(x, y, data.v, width, height, scale);
+        return;
+      }
+
+      case Op.GSPRITEROT: {
+        const rotation = toNum(this.pop());
+        const height = toNum(this.pop());
+        const width = toNum(this.pop());
+        const data = this.pop();
+        const y = toNum(this.pop());
+        const x = toNum(this.pop());
+        if (data.t !== 1) {
+          this.warn('rotated sprite data is not a string -> skipped');
+          return;
+        }
+        this.gfxEnsure();
+        this.gfxSpriteRotate(x, y, data.v, width, height, rotation);
+        return;
+      }
+
+      case Op.ACOPY: {
+        const count = toNum(this.pop());
+        const destIndex = toNum(this.pop());
+        const dest = this.pop();
+        const sourceIndex = toNum(this.pop());
+        const source = this.pop();
+        if (source.t !== 3 || dest.t !== 3 || count < 0 || sourceIndex < 0 || destIndex < 0) {
+          this.warn('Array.Copy needs two arrays and non-negative indexes');
+          return;
+        }
+        const n = Math.min(count, source.v.items.length - sourceIndex, dest.v.items.length - destIndex);
+        if (source === dest && destIndex > sourceIndex && destIndex < sourceIndex + n) {
+          for (let i = n - 1; i >= 0; i--) dest.v.items[destIndex + i] = source.v.items[sourceIndex + i];
+        } else {
+          for (let i = 0; i < n; i++) dest.v.items[destIndex + i] = source.v.items[sourceIndex + i];
+        }
         return;
       }
 

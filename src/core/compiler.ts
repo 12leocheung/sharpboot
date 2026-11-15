@@ -79,11 +79,19 @@ export const Op = {
   GPALETTE: 57,
   GSPRITE: 58,
   GTEXT: 59,
+  GBEGIN: 60,
+  GPRESENT: 61,
+  GENDBUF: 62,
+  GSPRITESCALE: 63,
+  GSPRITEROT: 64,
+  GPALETTEPRESET: 65,
+  GSETFONT: 66,
+  ACOPY: 67,
 } as const;
 
 export type Op = (typeof Op)[keyof typeof Op];
 
-export const OPCODE_COUNT = 60;
+export const OPCODE_COUNT = 68;
 
 type ArrayElement = 'int' | 'string' | 'bool';
 type ArrayType = 'int[]' | 'string[]' | 'bool[]';
@@ -169,6 +177,7 @@ class Compiler {
 
   private fn: FnState | null = null;
   private entryIndex = -1;
+  private tempCounter = 0;
 
   constructor(program: Program) {
     this.program = program;
@@ -502,6 +511,51 @@ class Compiler {
         return;
       }
 
+      case 'foreach': {
+        const iterableType = this.compileExpr(stmt.iterable);
+        if (!isArrayType(iterableType)) {
+          this.error('foreach currently requires an array', stmt.line, 'Use int[], string[], bool[] or char[].');
+          return;
+        }
+        const elementType = arrayElement(iterableType);
+        const temp = this.tempCounter++;
+        const arraySlot = this.declareLocal(`__foreach_array_${temp}`, iterableType);
+        const indexSlot = this.declareLocal(`__foreach_index_${temp}`, 'int');
+        this.emitStore(arraySlot);
+        this.emitWord(Op.PUSHI, 0);
+        this.emitStore(indexSlot);
+        const start = this.here();
+        this.emitPair(Op.LOAD, indexSlot);
+        this.emitPair(Op.LOAD, arraySlot);
+        this.emit(Op.LEN);
+        this.emit(Op.LT);
+        const endJump = this.emitJump(Op.JZ);
+        this.emitPair(Op.LOAD, arraySlot);
+        this.emitPair(Op.LOAD, indexSlot);
+        this.emit(Op.AGET);
+        this.fn?.breaks.push([]);
+        this.fn?.continues.push([]);
+        this.pushScope();
+        const valueType = stmt.varType ? this.paramType(stmt.varType) : elementType;
+        this.coerce(elementType, valueType, stmt.line);
+        const valueSlot = this.declareLocal(stmt.varName, valueType);
+        this.emitStore(valueSlot);
+        this.compileStatements(stmt.body);
+        this.popScope();
+        const updateLabel = this.here();
+        this.emitPair(Op.LOAD, indexSlot);
+        this.emitWord(Op.PUSHI, 1);
+        this.emit(Op.ADD);
+        this.emitStore(indexSlot);
+        this.patchTo(this.emitJump(Op.JMP), start);
+        const breaks = this.fn?.breaks.pop() ?? [];
+        const continues = this.fn?.continues.pop() ?? [];
+        for (const pos of continues) this.patchTo(pos, updateLabel);
+        for (const pos of breaks) this.patchToHere(pos);
+        this.patchToHere(endJump);
+        return;
+      }
+
       case 'for': {
         this.pushScope();
         if (stmt.init) this.compileStatement(stmt.init);
@@ -767,6 +821,19 @@ class Compiler {
         return `${expr.elementType}[]`;
       }
 
+      case 'arrayinit': {
+        this.emitWord(Op.PUSHI, expr.items.length);
+        this.emitPair(Op.NEWARR, elementTag(expr.elementType));
+        for (let index = 0; index < expr.items.length; index++) {
+          this.emit(Op.DUP);
+          this.emitWord(Op.PUSHI, index);
+          this.coerce(this.compileExpr(expr.items[index]), expr.elementType, expr.line);
+          this.emit(Op.ASET);
+          this.emit(Op.POP);
+        }
+        return `${expr.elementType}[]`;
+      }
+
       case 'new':
         this.error(
           '`new string(...)` is not available in this kernel',
@@ -967,6 +1034,7 @@ class Compiler {
       if (owner === 'int' || owner === 'Int32') return this.intCall(callee.name, call.args, call.line);
       if (owner === 'string' || owner === 'String') return this.stringCall(callee.name, call.args, call.line);
       if (owner === 'Convert') return this.convertCall(callee.name, call.args, call.line);
+      if (owner === 'Array') return this.arrayCall(callee.name, call.args, call.line);
       if (owner && this.globalByQualified.has(`${owner}.${callee.name}`)) {
         this.error(`Static field '${callee.name}' is not a method`, call.line);
       }
@@ -999,6 +1067,26 @@ class Compiler {
     this.error('Unsupported call expression', call.line);
     this.emitWord(Op.PUSHI, 0);
     return 'int';
+  }
+
+  private arrayCall(name: string, args: Expr[], line: number): VType {
+    if (name !== 'Copy') {
+      this.error('Array.Copy is the only supported Array method', line);
+      return 'void';
+    }
+    if (args.length !== 5) {
+      this.error('Array.Copy expects source, source index, destination, destination index and count', line);
+    }
+    const sourceType = args[0] ? this.compileExpr(args[0]) : 'int[]';
+    if (args[1]) this.coerce(this.compileExpr(args[1]), 'int', line); else this.emitWord(Op.PUSHI, 0);
+    const destType = args[2] ? this.compileExpr(args[2]) : 'int[]';
+    if (args[3]) this.coerce(this.compileExpr(args[3]), 'int', line); else this.emitWord(Op.PUSHI, 0);
+    if (args[4]) this.coerce(this.compileExpr(args[4]), 'int', line); else this.emitWord(Op.PUSHI, 0);
+    if (!isArrayType(sourceType) || !isArrayType(destType)) {
+      this.error('Array.Copy expects two arrays', line);
+    }
+    this.emit(Op.ACOPY);
+    return 'void';
   }
 
   private consoleCall(name: string, args: Expr[], line: number): VType {
@@ -1057,6 +1145,39 @@ class Compiler {
       return 'int';
     }
 
+    if (name === 'BeginBuffer' || name === 'Present' || name === 'EndBuffer') {
+      if (args.length !== 0) this.error(`Graphics.${name} takes no arguments`, line);
+      this.emit(name === 'BeginBuffer' ? Op.GBEGIN : name === 'Present' ? Op.GPRESENT : Op.GENDBUF);
+      return 'void';
+    }
+
+    if (name === 'PalettePreset') {
+      if (args.length !== 1) this.error('Graphics.PalettePreset expects one preset number', line);
+      if (args[0]) this.coerce(this.compileExpr(args[0]), 'int', line); else this.emitWord(Op.PUSHI, 0);
+      this.emit(Op.GPALETTEPRESET);
+      return 'void';
+    }
+
+    if (name === 'SetFont') {
+      if (args.length !== 1) this.error('Graphics.SetFont expects an 8x8 font string', line);
+      if (args[0]) this.coerce(this.compileExpr(args[0]), 'string', line); else this.emitString('');
+      this.emit(Op.GSETFONT);
+      return 'void';
+    }
+
+    if (name === 'SpriteScaled' || name === 'SpriteRotate') {
+      const arity = 6;
+      if (args.length !== arity) this.error(`Graphics.${name} expects ${arity} arguments`, line);
+      for (let i = 0; i < arity; i++) {
+        const isText = i === 2;
+        if (args[i]) this.coerce(this.compileExpr(args[i]), isText ? 'string' : 'int', line);
+        else if (isText) this.emitString('');
+        else this.emitWord(Op.PUSHI, 1);
+      }
+      this.emit(name === 'SpriteScaled' ? Op.GSPRITESCALE : Op.GSPRITEROT);
+      return 'void';
+    }
+
     if (name === 'SetPalette') {
       if (args.length !== 4) this.error('Graphics.SetPalette expects index, red, green and blue', line);
       for (let i = 0; i < 4; i++) {
@@ -1089,7 +1210,7 @@ class Compiler {
       this.error(
         `Graphics.${name} is not supported`,
         line,
-        'Use Init, End, Clear, SetPixel, FillRect, Rect, Line, FillCircle, Circle, Rgb, SetPalette, Sprite, Text, Width or Height.',
+        'Use Init, End, BeginBuffer, Present, EndBuffer, Clear, SetPixel, FillRect, Rect, Line, FillCircle, Circle, Rgb, SetPalette, PalettePreset, Sprite, SpriteScaled, SpriteRotate, Text, SetFont, Width or Height.',
       );
       return 'void';
     }

@@ -91,9 +91,40 @@ class Program
 `,
   },
   {
+    id: 'graphics2',
+    label: 'Buffered graphics',
+    hint: 'double buffer, palette preset, scaled and rotated sprites',
+    filename: 'buffered-graphics.cs',
+    source: `using System;
+
+class Program
+{
+    static void Main()
+    {
+        Graphics.Init();
+        Graphics.BeginBuffer();
+        Graphics.PalettePreset(2);
+        Graphics.Clear(0);
+
+        string ship = "..1111.." + ".111111." + "11111111" + "11122111"
+            + "11111111" + ".111111." + "..1..1.." + "..1..1..";
+        Graphics.SpriteScaled(24, 26, ship, 8, 8, 4);
+        Graphics.SpriteRotate(160, 26, ship, 8, 8, 1);
+        Graphics.Text(24, 100, "lowercase bitmap font in a double buffer", 15);
+
+        Graphics.Present();
+        int key = Console.ReadKey().KeyChar;
+        Graphics.EndBuffer();
+        Graphics.End();
+        Console.WriteLine("buffered graphics complete, key=" + key);
+    }
+}
+`,
+  },
+  {
     id: 'arrays',
     label: 'Arrays + GC',
-    hint: 'indexing, Length, helper methods and heap reuse',
+    hint: 'initializers, foreach, Length, helper methods and heap reuse',
     filename: 'arrays.cs',
     source: `using System;
 
@@ -102,20 +133,16 @@ class Program
     static int Sum(int[] values)
     {
         int total = 0;
-        for (int i = 0; i < values.Length; i++)
+        foreach (int value in values)
         {
-            total += values[i];
+            total += value;
         }
         return total;
     }
 
     static void Main()
     {
-        int[] scores = new int[6];
-        for (int i = 0; i < scores.Length; i++)
-        {
-            scores[i] = (i + 1) * 10;
-        }
+        int[] scores = new int[] { 10, 20, 30, 40, 50, 60 };
 
         string[] names = new string[3];
         names[0] = "Ada";

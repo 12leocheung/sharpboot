@@ -4,4 +4,5 @@ dist/
 .dev.log
 .dev.pid
 .tmp/
+.release/
 *.local

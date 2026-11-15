@@ -11,6 +11,7 @@
     "preview": "vite preview",
     "test": "node scripts/smoke.ts",
     "test:qemu": "node scripts/qemu.ts",
+    "release:image": "node scripts/release.ts",
     "smoke": "node scripts/smoke.ts"
   },
   "devDependencies": {
