@@ -49,7 +49,7 @@ class Program
   {
     id: 'graphics',
     label: 'Graphics demo',
-    hint: 'mode 13h shapes, RGB colors and ReadKey',
+    hint: 'palette, sprites, bitmap text and ReadKey',
     filename: 'graphics.cs',
     source: `using System;
 
@@ -73,9 +73,68 @@ class Program
         Graphics.Circle(235, 106, 72, Graphics.Rgb(255, 255, 255));
         Graphics.SetPixel(160, 100, 255);
 
+        for (int i = 1; i < 16; i++)
+        {
+            Graphics.SetPalette(i, i * 16, 210, 255 - i * 14);
+        }
+
+        string ship = "..1111.." + ".111111." + "11111111" + "11122111"
+            + "11111111" + ".111111." + "..1..1.." + "..1..1..";
+        Graphics.Sprite(24, 108, ship, 8, 8);
+        Graphics.Text(24, 128, "SHARPBOOT SPRITE + BITMAP TEXT", 15);
+
         int key = Console.ReadKey().KeyChar;
         Graphics.End();
         Console.WriteLine("graphics demo complete, key=" + key);
+    }
+}
+`,
+  },
+  {
+    id: 'arrays',
+    label: 'Arrays + GC',
+    hint: 'indexing, Length, helper methods and heap reuse',
+    filename: 'arrays.cs',
+    source: `using System;
+
+class Program
+{
+    static int Sum(int[] values)
+    {
+        int total = 0;
+        for (int i = 0; i < values.Length; i++)
+        {
+            total += values[i];
+        }
+        return total;
+    }
+
+    static void Main()
+    {
+        int[] scores = new int[6];
+        for (int i = 0; i < scores.Length; i++)
+        {
+            scores[i] = (i + 1) * 10;
+        }
+
+        string[] names = new string[3];
+        names[0] = "Ada";
+        names[1] = "Grace";
+        names[2] = "Linus";
+
+        Console.WriteLine("scores total=" + Sum(scores));
+        Console.WriteLine("scores length=" + scores.Length);
+        Console.WriteLine("first=" + names[0]);
+        Console.WriteLine("last=" + names[2]);
+
+        for (int round = 0; round < 64; round++)
+        {
+            int[] block = new int[160];
+            block[0] = round;
+            block[159] = round;
+            if (block[0] != block[159]) Console.WriteLine("heap check failed");
+        }
+        Console.WriteLine("heap reuse ok");
     }
 }
 `,

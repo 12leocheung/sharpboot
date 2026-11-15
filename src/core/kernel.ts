@@ -1,8 +1,8 @@
 /**
  * SharpBoot bare-metal runtime kernel.
  *
- * A 16-bit real-mode bytecode interpreter with VGA text and mode 13h graphics, a bump-allocated
- * string heap and BIOS keyboard input. Assembled by src/core/asm.ts and placed at
+ * A 16-bit real-mode bytecode interpreter with VGA text and mode 13h graphics, a garbage-collected
+ * object heap and BIOS keyboard input. Assembled by src/core/asm.ts and placed at
  * 0x1000:0x0200 by the boot sector.
  *
  * Program header (offsets in the loaded segment at 0x1000):
@@ -16,25 +16,33 @@
  */
 
 export const KERNEL_ORIGIN = 0x0200;
-export const CODE_START = 0x1800;
-export const STRING_START = 0x3800;
-export const GLOBAL_START = 0x5000;
+export const CODE_START = 0x3000;
+export const STRING_START = 0x4800;
+export const GLOBAL_START = 0x5800;
 export const VM_STACK_TOP = 0x7000;
-export const VM_STACK_LOW = 0x5800;
-export const HEAP_START = 0x7000;
+export const VM_STACK_LOW = 0x6000;
+export const HEAP_START = 0x8000;
 export const HEAP_LIMIT = 0xf000;
 export const MAX_GLOBALS = 512;
 export const MAX_CODE_BYTES = STRING_START - CODE_START;
 export const MAX_STRING_BYTES = GLOBAL_START - STRING_START;
 
+import { FONT_8X8 } from './graphics.ts';
+
+const FONT_LINES = Array.from({ length: FONT_8X8.length / 16 }, (_, row) =>
+  `  db ${FONT_8X8.slice(row * 16, row * 16 + 16).map((byte) => `0x${byte.toString(16).padStart(2, '0')}`).join(',')}`,
+).join('\n');
+
 export const KERNEL_SOURCE = String.raw`
 ; ---------------------------------------------------------------- constants
 VGA          equ 0xB800
-GLOBAL_BASE  equ 0x5000
+GLOBAL_BASE  equ 0x5800
 STACK_TOP    equ 0x7000
-STACK_LOW    equ 0x5800
+STACK_LOW    equ 0x6000
 HEAP_BASE    equ 0x8000
 HEAP_MAX     equ 0xF000
+HEAP_SIZE    equ 0x7000
+GC_ROOTS     equ 7
 
 OP_HALT      equ 0
 OP_PUSHI     equ 1
@@ -90,7 +98,13 @@ OP_GLINE     equ 50
 OP_GFILLCIRCLE equ 51
 OP_GCIRCLE   equ 52
 OP_RGB       equ 53
-OP_COUNT     equ 54
+OP_NEWARR    equ 54
+OP_AGET      equ 55
+OP_ASET      equ 56
+OP_GPALETTE  equ 57
+OP_GSPRITE   equ 58
+OP_GTEXT     equ 59
+OP_COUNT     equ 60
 
 ; ---------------------------------------------------------------- entry
 start:
@@ -107,7 +121,9 @@ start:
   mov word [col], 0
   mov word [cur_off], 0
   mov byte [cur_attr], 0x0F
-  mov word [heap], HEAP_BASE
+  mov di, HEAP_BASE
+  mov word [di], HEAP_SIZE
+  mov word [di+2], 0
   mov word [vsp], STACK_TOP
 
   call clear_screen
@@ -152,6 +168,9 @@ fault_code:
   jmp fatal
 fault_op:
   mov di, msg_op
+  jmp fatal
+fault_array:
+  mov di, msg_arr
   jmp fatal
 stack_overflow:
   mov di, msg_stack
@@ -419,14 +438,242 @@ itoa_done:
   ret
 
 ; ---------------------------------------------------------------- heap / strings
-; CX bytes -> DI
+; CX bytes -> DI. Blocks carry a 4-byte header: size, type, mark.
+; Type 0 is free, type 1 is a string and type 3 is an array.
 alloc:
-  mov di, [heap]
-  mov ax, di
-  add ax, cx
-  cmp ax, HEAP_MAX
-  ja oom
-  mov [heap], ax
+  push ax
+  push bx
+  push cx
+  push dx
+  push si
+  push bp
+  mov byte [gc_retry], 0
+  mov ax, cx
+  add ax, 4
+  jc alloc_fail
+  add ax, 1
+  and ax, 0xFFFE
+  jc alloc_fail
+  mov cx, ax
+alloc_scan:
+  mov di, HEAP_BASE
+alloc_walk:
+  cmp di, HEAP_MAX
+  jae alloc_full
+  mov bx, [di]
+  test bx, bx
+  jz alloc_full
+  cmp byte [di+2], 0
+  jne alloc_next
+  cmp bx, cx
+  jb alloc_next
+  mov ax, bx
+  sub ax, cx
+  cmp ax, 8
+  jb alloc_take
+  mov [di], cx
+  mov bx, di
+  add bx, cx
+  mov [bx], ax
+  mov word [bx+2], 0
+alloc_take:
+  mov word [di+2], 1
+  add di, 4
+  pop bp
+  pop si
+  pop dx
+  pop cx
+  pop bx
+  pop ax
+  ret
+alloc_next:
+  add di, bx
+  jmp alloc_walk
+alloc_full:
+  cmp byte [gc_retry], 0
+  jne alloc_fail
+  mov byte [gc_retry], 1
+  call gc_collect
+  jmp alloc_scan
+alloc_fail:
+  pop bp
+  pop si
+  pop dx
+  pop cx
+  pop bx
+  pop ax
+  jmp oom
+
+; ---------------------------------------------------------------- garbage collector
+; Conservative mark/sweep. Roots are globals, the value stack (including the
+; Main locals at 0x7000-0x7fff) and a few string temporaries used by routines
+; that allocate while their operands are out of the VM stack.
+gc_collect:
+  push ax
+  push bx
+  push cx
+  push dx
+  push si
+  push di
+  push bp
+
+  mov di, HEAP_BASE
+gc_clear:
+  cmp di, HEAP_MAX
+  jae gc_mark
+  mov ax, [di]
+  test ax, ax
+  jz gc_mark
+  mov byte [di+3], 0
+  cmp byte [di+2], 0
+  jne gc_clear_next
+gc_clear_merge:
+  mov bx, di
+  add bx, ax
+  cmp bx, HEAP_MAX
+  jae gc_clear_next
+  cmp byte [bx+2], 0
+  jne gc_clear_next
+  add ax, [bx]
+  mov [di], ax
+  jmp gc_clear_merge
+gc_clear_next:
+  add di, ax
+  jmp gc_clear
+
+gc_mark:
+  mov cx, [0x000C]
+  mov di, GLOBAL_BASE
+gc_mark_globals:
+  test cx, cx
+  jz gc_mark_stack
+  push cx
+  push di
+  mov al, [di]
+  mov dx, [di+2]
+  call gc_mark_val
+  pop di
+  pop cx
+  add di, 4
+  dec cx
+  jmp gc_mark_globals
+
+gc_mark_stack:
+  mov di, [vsp]
+gc_mark_stack_loop:
+  cmp di, HEAP_BASE
+  jae gc_mark_temps
+  push di
+  mov al, [di]
+  mov dx, [di+2]
+  call gc_mark_val
+  pop di
+  add di, 4
+  jmp gc_mark_stack_loop
+
+gc_mark_temps:
+  mov di, gc_roots
+  mov cx, GC_ROOTS
+gc_mark_temps_loop:
+  test cx, cx
+  jz gc_sweep
+  push cx
+  push di
+  mov dx, [di]
+  call gc_mark_ptr
+  pop di
+  pop cx
+  add di, 2
+  dec cx
+  jmp gc_mark_temps_loop
+
+gc_sweep:
+  mov di, HEAP_BASE
+gc_sweep_loop:
+  cmp di, HEAP_MAX
+  jae gc_done
+  mov ax, [di]
+  test ax, ax
+  jz gc_done
+  cmp byte [di+2], 0
+  je gc_sweep_free
+  cmp byte [di+3], 0
+  jne gc_sweep_next
+  mov byte [di+2], 0
+gc_sweep_free:
+  mov bx, di
+  add bx, ax
+  cmp bx, HEAP_MAX
+  jae gc_sweep_next
+  cmp byte [bx+2], 0
+  jne gc_sweep_next
+  add ax, [bx]
+  mov [di], ax
+  jmp gc_sweep_free
+gc_sweep_next:
+  add di, ax
+  jmp gc_sweep_loop
+
+gc_done:
+  pop bp
+  pop di
+  pop si
+  pop dx
+  pop cx
+  pop bx
+  pop ax
+  ret
+
+gc_mark_val:
+  cmp al, 1
+  je gc_mark_val_ptr
+  cmp al, 3
+  jne gc_mark_val_ret
+gc_mark_val_ptr:
+  call gc_mark_ptr
+gc_mark_val_ret:
+  ret
+
+; DX = payload pointer
+gc_mark_ptr:
+  cmp dx, HEAP_BASE
+  jbe gc_mark_ptr_ret
+  cmp dx, HEAP_MAX
+  jae gc_mark_ptr_ret
+  push bx
+  mov bx, dx
+  sub bx, 4
+  mov al, [bx+2]
+  test al, al
+  jz gc_mark_ptr_ret_pop
+  cmp al, 1
+  je gc_mark_ptr_obj
+  cmp al, 3
+  jne gc_mark_ptr_ret_pop
+gc_mark_ptr_obj:
+  cmp byte [bx+3], 0
+  jne gc_mark_ptr_ret_pop
+  mov byte [bx+3], 1
+  cmp al, 3
+  jne gc_mark_ptr_ret_pop
+  mov cx, [bx+4]
+  test cx, cx
+  jz gc_mark_ptr_ret_pop
+  add bx, 6
+gc_mark_array_loop:
+  cmp byte [bx], 1
+  jne gc_mark_array_next
+  push cx
+  mov dx, [bx+2]
+  call gc_mark_ptr
+  pop cx
+gc_mark_array_next:
+  add bx, 4
+  dec cx
+  jnz gc_mark_array_loop
+gc_mark_ptr_ret_pop:
+  pop bx
+gc_mark_ptr_ret:
   ret
 
 str_len:
@@ -1157,7 +1404,10 @@ op_tostr:
 op_len:
   call pop_val
   cmp al, 1
+  je op_len_ok
+  cmp al, 3
   jne op_len_bad
+op_len_ok:
   mov di, dx
   call str_len
   mov dx, cx
@@ -1949,6 +2199,357 @@ op_rgb:
   call push_val
   jmp run
 
+; ---------------------------------------------------------------- array opcodes
+op_newarr:
+  mov al, [si]
+  add si, 2
+  mov [tmp_byte], al
+  call pop_val
+  mov [tmp_len], dx
+  test dx, dx
+  js fault_array
+  cmp dx, 7000
+  ja fault_array
+  mov ax, dx
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  jc fault_array
+  mov cx, ax
+  call alloc
+  mov [tmp_ptr], di
+  mov byte [di-2], 3
+  mov bx, [tmp_len]
+  mov [di], bx
+  add di, 2
+  mov cx, bx
+  mov al, [tmp_byte]
+  test cx, cx
+  jz op_newarr_done
+op_newarr_loop:
+  mov [di], al
+  mov byte [di+1], 0
+  mov word [di+2], 0
+  cmp al, 1
+  jne op_newarr_next
+  mov dx, msg_empty
+  mov [di+2], dx
+op_newarr_next:
+  add di, 4
+  dec cx
+  jnz op_newarr_loop
+op_newarr_done:
+  mov al, 3
+  mov dx, [tmp_ptr]
+  call push_val
+  jmp run
+
+op_aget:
+  call pop_val
+  mov [tmp_len], dx
+  call pop_val
+  cmp al, 3
+  jne fault_array
+  mov bx, dx
+  mov ax, [tmp_len]
+  test ax, ax
+  js fault_array
+  cmp ax, [bx]
+  jae fault_array
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add bx, ax
+  mov al, [bx]
+  mov dx, [bx+2]
+  call push_val
+  jmp run
+
+op_aset:
+  call pop_val
+  mov [a_type], al
+  mov [a_val], dx
+  call pop_val
+  mov [tmp_len], dx
+  call pop_val
+  cmp al, 3
+  jne fault_array
+  mov bx, dx
+  mov ax, [tmp_len]
+  test ax, ax
+  js fault_array
+  cmp ax, [bx]
+  jae fault_array
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add bx, ax
+  mov al, [a_type]
+  mov [bx], al
+  mov dx, [a_val]
+  mov [bx+2], dx
+  call push_val
+  jmp run
+
+op_gpalette:
+  call pop_val
+  mov [gfx_b], dl
+  call pop_val
+  mov [gfx_g], dl
+  call pop_val
+  mov [gfx_r], dl
+  call pop_val
+  cmp dx, 255
+  ja op_gpalette_done
+  mov bx, dx
+  mov dh, [gfx_r]
+  shr dh, 1
+  shr dh, 1
+  mov ch, [gfx_g]
+  shr ch, 1
+  shr ch, 1
+  mov cl, [gfx_b]
+  shr cl, 1
+  shr cl, 1
+  mov ax, 0x1010
+  int 0x10
+op_gpalette_done:
+  jmp run
+
+op_gsprite:
+  call ensure_gfx
+  call pop_val
+  mov [gfx_h], dx
+  call pop_val
+  mov [gfx_w], dx
+  call pop_val
+  cmp al, 1
+  jne op_gsprite_bad
+  mov [gfx_src], dx
+  call pop_val
+  mov [gfx_y], dx
+  call pop_val
+  mov [gfx_x], dx
+  call gfx_sprite
+  jmp run
+op_gsprite_bad:
+  mov di, msg_type
+  call warn
+  jmp run
+
+op_gtext:
+  call ensure_gfx
+  call pop_val
+  mov [gfx_c], dl
+  call pop_val
+  cmp al, 1
+  jne op_gtext_bad
+  mov [gfx_src], dx
+  call pop_val
+  mov [gfx_y], dx
+  call pop_val
+  mov [gfx_x], dx
+  call gfx_text
+  jmp run
+op_gtext_bad:
+  mov di, msg_type
+  call warn
+  jmp run
+
+; ---------------------------------------------------------------- extended graphics
+; AX=source offset, BX=row, CL=color
+gfx_font_byte:
+  push ax
+  push bx
+  push cx
+  push dx
+  push di
+  mov [gfx_py], bx
+  mov [gfx_c], cl
+  mov word [gfx_bit], 0
+gfx_font_bits:
+  cmp word [gfx_bit], 8
+  jae gfx_font_byte_done
+  mov ax, [gfx_bits]
+  test al, 0x80
+  jz gfx_font_skip
+  mov ax, [gfx_tx]
+  add ax, [gfx_bit]
+  mov bx, [gfx_py]
+  mov cl, [gfx_c]
+  call gfx_setpixel
+gfx_font_skip:
+  mov al, [gfx_bits]
+  shl al, 1
+  mov [gfx_bits], al
+  inc word [gfx_bit]
+  jmp gfx_font_bits
+gfx_font_byte_done:
+  pop di
+  pop dx
+  pop cx
+  pop bx
+  pop ax
+  ret
+
+; Draw an 8x8 bitmap-font string. [gfx_src] = string pointer, [gfx_x]/[gfx_y].
+gfx_text:
+  push ax
+  push bx
+  push cx
+  push dx
+  push si
+  push di
+  mov si, [gfx_src]
+  mov ax, [si]
+  mov [gfx_len], ax
+  add si, 2
+  mov ax, [gfx_x]
+  mov [gfx_tx], ax
+  mov ax, [gfx_y]
+  mov [gfx_ty], ax
+gfx_text_char:
+  cmp word [gfx_len], 0
+  jbe gfx_text_done
+  mov al, [si]
+  inc si
+  dec word [gfx_len]
+  cmp al, 10
+  jne gfx_text_not_nl
+  mov ax, [gfx_x]
+  mov [gfx_tx], ax
+  add word [gfx_ty], 8
+  jmp gfx_text_char
+gfx_text_not_nl:
+  cmp al, 13
+  je gfx_text_char
+  cmp al, 'a'
+  jb gfx_text_upper_done
+  cmp al, 'z'
+  ja gfx_text_upper_done
+  sub al, 32
+gfx_text_upper_done:
+  cmp al, 32
+  jb gfx_text_badglyph
+  cmp al, 95
+  jbe gfx_text_glyph
+gfx_text_badglyph:
+  mov al, '?'
+gfx_text_glyph:
+  sub al, 32
+  xor ah, ah
+  shl ax, 1
+  shl ax, 1
+  shl ax, 1
+  add ax, font_data
+  mov [gfx_glyph], ax
+  mov word [gfx_row], 0
+gfx_text_row:
+  cmp word [gfx_row], 8
+  jae gfx_text_char_done
+  mov bx, [gfx_glyph]
+  mov al, [bx]
+  mov [gfx_bits], al
+  inc word [gfx_glyph]
+  mov ax, [gfx_tx]
+  mov bx, [gfx_ty]
+  add bx, [gfx_row]
+  mov cl, [gfx_c]
+  call gfx_font_byte
+  inc word [gfx_row]
+  jmp gfx_text_row
+gfx_text_char_done:
+  add word [gfx_tx], 8
+  jmp gfx_text_char
+gfx_text_done:
+  pop di
+  pop si
+  pop dx
+  pop cx
+  pop bx
+  pop ax
+  ret
+
+; Draw a string sprite. [gfx_src]=string, [gfx_x]/[gfx_y]/[gfx_w]/[gfx_h].
+gfx_sprite:
+  push ax
+  push bx
+  push cx
+  push dx
+  push si
+  push di
+  mov si, [gfx_src]
+  mov ax, [si]
+  mov [gfx_len], ax
+  add si, 2
+  cmp word [gfx_w], 0
+  jle gfx_sprite_done
+  cmp word [gfx_h], 0
+  jle gfx_sprite_done
+  mov word [gfx_row], 0
+gfx_sprite_row:
+  mov ax, [gfx_row]
+  cmp ax, [gfx_h]
+  jae gfx_sprite_done
+  mov word [gfx_col], 0
+gfx_sprite_col:
+  mov ax, [gfx_col]
+  cmp ax, [gfx_w]
+  jae gfx_sprite_next_row
+  cmp word [gfx_len], 0
+  je gfx_sprite_done
+  mov al, [si]
+  inc si
+  dec word [gfx_len]
+  cmp al, 32
+  je gfx_sprite_skip
+  cmp al, '.'
+  je gfx_sprite_skip
+  mov bl, al
+  cmp al, '0'
+  jb gfx_sprite_other
+  cmp al, '9'
+  ja gfx_sprite_alpha
+  sub al, '0'
+  jmp gfx_sprite_got
+gfx_sprite_alpha:
+  cmp al, 'A'
+  jb gfx_sprite_lower
+  cmp al, 'F'
+  ja gfx_sprite_lower
+  sub al, 'A' - 10
+  jmp gfx_sprite_got
+gfx_sprite_lower:
+  cmp al, 'a'
+  jb gfx_sprite_other
+  cmp al, 'f'
+  ja gfx_sprite_other
+  sub al, 'a' - 10
+  jmp gfx_sprite_got
+gfx_sprite_other:
+  mov al, bl
+gfx_sprite_got:
+  mov cl, al
+  mov ax, [gfx_x]
+  add ax, [gfx_col]
+  mov bx, [gfx_y]
+  add bx, [gfx_row]
+  call gfx_setpixel
+gfx_sprite_skip:
+  inc word [gfx_col]
+  jmp gfx_sprite_col
+gfx_sprite_next_row:
+  inc word [gfx_row]
+  jmp gfx_sprite_row
+gfx_sprite_done:
+  pop di
+  pop si
+  pop dx
+  pop cx
+  pop bx
+  pop ax
+  ret
+
 ; ---------------------------------------------------------------- dispatch table
 jt:
   dw op_halt, op_pushi, op_pushs, op_load, op_store, op_loadg, op_storeg
@@ -1961,6 +2562,7 @@ jt:
   dw op_abs, op_min, op_max, op_upper, op_lower
   dw op_ginit, op_gend, op_gclear, op_gpixel, op_gfillrect
   dw op_grect, op_gline, op_gfillcircle, op_gcircle, op_rgb
+  dw op_newarr, op_aget, op_aset, op_gpalette, op_gsprite, op_gtext
 
 ; ---------------------------------------------------------------- data
 row:        dw 0
@@ -1969,6 +2571,8 @@ cur_off:    dw 0
 cur_attr:   db 0x0F
 vsp:        dw 0
 heap:       dw 0
+gc_retry:   db 0
+gc_roots:   dw a_val, b_val, c_val, tmp_ptr, tmp_dst, in_ptr, pv_val
 a_type:     db 0
 a_val:      dw 0
 a_len:      dw 0
@@ -2015,6 +2619,19 @@ gfx_sx:     dw 0
 gfx_sy:     dw 0
 gfx_err:    dw 0
 gfx_e2:     dw 0
+gfx_src:    dw 0
+gfx_tx:     dw 0
+gfx_ty:     dw 0
+gfx_py:     dw 0
+gfx_row:    dw 0
+gfx_col:    dw 0
+gfx_bit:    dw 0
+gfx_glyph:  dw 0
+gfx_len:    dw 0
+gfx_bits:   db 0
+
+font_data:
+${FONT_LINES}
 
 msg_boot:   msg "\nSharpBoot 2.0 / 16-bit C# runtime\n\n"
 msg_halted: msg "\n[program halted]"
@@ -2024,7 +2641,8 @@ msg_parse:  msg "\n[repair] unreadable number -> 0\n"
 msg_type:   msg "\n[repair] wrong value type -> 0\n"
 msg_strord: msg "\n[repair] string ordering is unsupported -> false\n"
 msg_esc:    msg "\n[halted by ESC]\n"
-msg_oom:    msg "\n[fatal] string heap exhausted\n"
+msg_oom:    msg "\n[fatal] heap exhausted\n"
+msg_arr:    msg "\n[fatal] array index or allocation error\n"
 msg_stack:  msg "\n[fatal] VM stack overflow\n"
 msg_code:   msg "\n[fatal] bytecode overrun\n"
 msg_op:     msg "\n[fatal] unknown opcode\n"

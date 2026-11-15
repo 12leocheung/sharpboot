@@ -73,13 +73,33 @@ export const Op = {
   GFILLCIRCLE: 51,
   GCIRCLE: 52,
   RGB: 53,
+  NEWARR: 54,
+  AGET: 55,
+  ASET: 56,
+  GPALETTE: 57,
+  GSPRITE: 58,
+  GTEXT: 59,
 } as const;
 
 export type Op = (typeof Op)[keyof typeof Op];
 
-export const OPCODE_COUNT = 54;
+export const OPCODE_COUNT = 60;
 
-type VType = 'int' | 'string' | 'bool' | 'void';
+type ArrayElement = 'int' | 'string' | 'bool';
+type ArrayType = 'int[]' | 'string[]' | 'bool[]';
+type VType = 'int' | 'string' | 'bool' | 'void' | ArrayType;
+
+function isArrayType(type: VType): type is ArrayType {
+  return type === 'int[]' || type === 'string[]' || type === 'bool[]';
+}
+
+function arrayElement(type: ArrayType): ArrayElement {
+  return type.slice(0, -2) as ArrayElement;
+}
+
+function elementTag(type: ArrayElement): number {
+  return type === 'string' ? 1 : type === 'bool' ? 2 : 0;
+}
 
 interface GlobalVar {
   name: string;
@@ -255,8 +275,8 @@ class Compiler {
             'Use int (whole numbers) or string.',
           );
         }
-        if (param.type === 'string[]' && !(method.name === 'Main' && method.params.indexOf(param) === 0)) {
-          this.error('Only Main(string[] args) may take a string[] parameter', method.line);
+        if (param.type === 'int[]' || param.type === 'string[]' || param.type === 'bool[]') {
+          // Arrays are passed by reference as a tagged pointer.
         }
       }
       if (method.params.length > 8) {
@@ -298,7 +318,7 @@ class Compiler {
       return null;
     }
     if (type === 'char') return 'string';
-    if (type === 'string[]') return 'string';
+    if (type === 'int[]' || type === 'string[]' || type === 'bool[]') return type;
     if (type === 'var') return null;
     if (type === 'void') return 'void';
     return type;
@@ -363,7 +383,7 @@ class Compiler {
 
   private paramType(type: TypeName): VType {
     if (type === 'double') return 'int';
-    if (type === 'char' || type === 'string[]') return 'string';
+    if (type === 'char') return 'string';
     if (type === 'void') return 'int';
     return type === 'var' ? 'int' : type;
   }
@@ -701,14 +721,18 @@ class Compiler {
       case 'member':
         return this.compileMember(expr);
 
-      case 'index':
-        this.error(
-          'String and array indexing is not supported by the 16-bit kernel',
-          expr.line,
-          'Use .Length with a loop over ReadLine input, or build the value you need directly.',
-        );
-        this.emitWord(Op.PUSHI, 0);
-        return 'int';
+      case 'index': {
+        const objectType = this.compileExpr(expr.object);
+        const indexType = this.compileExpr(expr.index);
+        this.coerce(indexType, 'int', expr.line);
+        if (!isArrayType(objectType)) {
+          this.error('Only arrays can be indexed', expr.line, 'Create the value with new int[n], then index it.');
+          this.emitWord(Op.PUSHI, 0);
+          return 'int';
+        }
+        this.emit(Op.AGET);
+        return arrayElement(objectType);
+      }
 
       case 'cond': {
         const cond = this.compileExpr(expr.cond);
@@ -734,6 +758,13 @@ class Compiler {
         }
         this.coerce(type, 'int', expr.line);
         return 'int';
+      }
+
+      case 'newarray': {
+        const sizeType = this.compileExpr(expr.size);
+        this.coerce(sizeType, 'int', expr.line);
+        this.emitPair(Op.NEWARR, elementTag(expr.elementType));
+        return `${expr.elementType}[]`;
       }
 
       case 'new':
@@ -866,6 +897,27 @@ class Compiler {
         this.emitWord(global?.index ?? 0);
       }
       return targetType;
+    }
+
+    if (expr.target.kind === 'index') {
+      const objectType = this.compileExpr(expr.target.object);
+      const indexType = this.compileExpr(expr.target.index);
+      this.coerce(indexType, 'int', expr.line);
+      if (!isArrayType(objectType)) {
+        this.error('Only arrays can be indexed', expr.line);
+        this.compileExpr(expr.value);
+        return 'int';
+      }
+      const elementType = arrayElement(objectType);
+      if (expr.op !== '=') {
+        this.error('Array elements only support plain = assignment', expr.line, 'Use arr[i] = arr[i] + value.');
+        this.compileExpr(expr.value);
+        return elementType;
+      }
+      const valueType = this.compileExpr(expr.value);
+      this.coerce(valueType, elementType, expr.line);
+      this.emit(Op.ASET);
+      return elementType;
     }
 
     if (expr.target.kind === 'member' && expr.target.object.kind === 'ident') {
@@ -1005,6 +1057,29 @@ class Compiler {
       return 'int';
     }
 
+    if (name === 'SetPalette') {
+      if (args.length !== 4) this.error('Graphics.SetPalette expects index, red, green and blue', line);
+      for (let i = 0; i < 4; i++) {
+        if (args[i]) this.coerce(this.compileExpr(args[i]), 'int', line);
+        else this.emitWord(Op.PUSHI, 0);
+      }
+      this.emit(Op.GPALETTE);
+      return 'void';
+    }
+
+    if (name === 'Sprite' || name === 'Text') {
+      const arity = name === 'Sprite' ? 5 : 4;
+      if (args.length !== arity) this.error(`Graphics.${name} expects ${arity} arguments`, line);
+      for (let i = 0; i < arity; i++) {
+        const isText = i === 2;
+        if (args[i]) this.coerce(this.compileExpr(args[i]), isText ? 'string' : 'int', line);
+        else if (isText) this.emitString('');
+        else this.emitWord(Op.PUSHI, 0);
+      }
+      this.emit(name === 'Sprite' ? Op.GSPRITE : Op.GTEXT);
+      return 'void';
+    }
+
     const arity = name === 'Clear' ? 1
       : name === 'SetPixel' ? 3
       : name === 'FillRect' || name === 'Rect' || name === 'Line' ? 5
@@ -1014,7 +1089,7 @@ class Compiler {
       this.error(
         `Graphics.${name} is not supported`,
         line,
-        'Use Init, End, Clear, SetPixel, FillRect, Rect, Line, FillCircle, Circle, Rgb, Width or Height.',
+        'Use Init, End, Clear, SetPixel, FillRect, Rect, Line, FillCircle, Circle, Rgb, SetPalette, Sprite, Text, Width or Height.',
       );
       return 'void';
     }
@@ -1173,7 +1248,7 @@ class Compiler {
     }
     const objectType = this.compileExpr(expr.object);
     if (expr.name === 'Length') {
-      this.coerce(objectType, 'string', expr.line);
+      if (!isArrayType(objectType)) this.coerce(objectType, 'string', expr.line);
       this.emit(Op.LEN);
       return 'int';
     }
@@ -1246,8 +1321,16 @@ class Compiler {
   }
 
   private emitDefault(type: VType): void {
-    if (type === 'string') this.emitString(DEFAULT_TEXT);
-    else this.emitWord(Op.PUSHI, 0);
+    if (type === 'string') {
+      this.emitString(DEFAULT_TEXT);
+      return;
+    }
+    if (isArrayType(type)) {
+      this.emitWord(Op.PUSHI, 0);
+      this.emitPair(Op.NEWARR, elementTag(arrayElement(type)));
+      return;
+    }
+    this.emitWord(Op.PUSHI, 0);
   }
 
   private emitStore(slot: number): void {
@@ -1291,6 +1374,10 @@ class Compiler {
     if (from === to) return;
     if (to === 'void') {
       this.error('A void expression cannot be used as a value', line);
+      return;
+    }
+    if (isArrayType(to) || isArrayType(from)) {
+      this.error(`Cannot convert ${from} to ${to}`, line, 'Arrays keep their element type.');
       return;
     }
     if (to === 'string') {

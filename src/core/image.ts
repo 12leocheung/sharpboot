@@ -312,7 +312,7 @@ export function describeLayout(layout: ImageLayout): { label: string; value: str
     { label: 'boot sector', value: '512 B @ 0x7c00' },
     { label: 'kernel', value: `${layout.kernelBytes} B @ 0x1000:0200` },
     { label: 'bytecode', value: `${layout.codeBytes} B · ${layout.methodCount} methods` },
-    { label: 'static strings', value: `${layout.stringBytes} B @ 0x1000:3800` },
+    { label: 'static strings', value: `${layout.stringBytes} B @ 0x1000:${STRING_START.toString(16).padStart(4, '0')}` },
     { label: 'image', value: `1.44 MB · ${layout.sectorCount} sectors read` },
   ];
 }

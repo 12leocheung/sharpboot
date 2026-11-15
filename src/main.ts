@@ -4,7 +4,7 @@ import type { BuildResult } from './core/pipeline.ts';
 import { BytecodeVm } from './core/vm.ts';
 import type { VmCell, VmState } from './core/vm.ts';
 import { describeLayout } from './core/image.ts';
-import { GRAPHICS_HEIGHT, GRAPHICS_WIDTH, paletteColor } from './core/graphics.ts';
+import { GRAPHICS_HEIGHT, GRAPHICS_WIDTH } from './core/graphics.ts';
 import { SAMPLES, DEFAULT_SAMPLE } from './core/samples.ts';
 
 const VGA_PALETTE = [
@@ -52,13 +52,6 @@ const gfxContext2d = gfxCanvas.getContext('2d');
 if (!gfxContext2d) throw new Error('Canvas 2D context is unavailable');
 const gfxContext: CanvasRenderingContext2D = gfxContext2d;
 const gfxImage = gfxContext.createImageData(GRAPHICS_WIDTH, GRAPHICS_HEIGHT);
-const gfxPalette = new Uint8Array(256 * 3);
-for (let index = 0; index < 256; index++) {
-  const [red, green, blue] = paletteColor(index);
-  gfxPalette[index * 3] = red;
-  gfxPalette[index * 3 + 1] = green;
-  gfxPalette[index * 3 + 2] = blue;
-}
 const screenEmpty = must<HTMLDivElement>('screen-empty');
 const screenEmptyDetail = must<HTMLSpanElement>('screen-empty-detail');
 const consoleStatus = must<HTMLSpanElement>('console-status');
@@ -231,13 +224,13 @@ function renderScreen(cells: VmCell[]): void {
   fitScreen();
 }
 
-function renderGraphics(pixels: Uint8Array): void {
+function renderGraphics(pixels: Uint8Array, palette: Uint8Array): void {
   const data = gfxImage.data;
   for (let index = 0, offset = 0; index < pixels.length; index++, offset += 4) {
-    const palette = pixels[index] * 3;
-    data[offset] = gfxPalette[palette];
-    data[offset + 1] = gfxPalette[palette + 1];
-    data[offset + 2] = gfxPalette[palette + 2];
+    const entry = pixels[index] * 3;
+    data[offset] = palette[entry];
+    data[offset + 1] = palette[entry + 1];
+    data[offset + 2] = palette[entry + 2];
     data[offset + 3] = 255;
   }
   gfxContext.putImageData(gfxImage, 0, 0);
@@ -248,7 +241,7 @@ function renderGraphics(pixels: Uint8Array): void {
 
 function renderDisplay(vm: BytecodeVm): void {
   if (vm.graphicsActive()) {
-    renderGraphics(vm.graphicsPixels());
+    renderGraphics(vm.graphicsPixels(), vm.palette());
     return;
   }
   gfxCanvas.hidden = true;

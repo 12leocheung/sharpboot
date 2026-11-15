@@ -10,6 +10,7 @@
     "build:pages": "tsc --noEmit && vite build --mode pages",
     "preview": "vite preview",
     "test": "node scripts/smoke.ts",
+    "test:qemu": "node scripts/qemu.ts",
     "smoke": "node scripts/smoke.ts"
   },
   "devDependencies": {

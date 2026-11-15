@@ -129,7 +129,7 @@ check(interactive.ok, `interactive sample failed to build: ${interactive.diagnos
 check((interactive.image?.length ?? 0) === IMAGE_SIZE, 'boot image is not 1.44 MB');
 check(interactive.image?.[510] === 0x55 && interactive.image?.[511] === 0xaa, 'boot signature is missing');
 check((interactive.stats.kernelBytes ?? 0) > 0, 'kernel was not assembled');
-check((interactive.stats.kernelBytes ?? 0) < 5632, 'kernel overflows its 0x0200-0x17ff slot');
+check((interactive.stats.kernelBytes ?? 0) < 11776, 'kernel overflows its 0x0200-0x2fff slot');
 check(interactive.stats.sectorCount === SECTORS_TO_LOAD, 'boot sector does not load the expected payload');
 console.log(
   `  image ${interactive.image?.length ?? 0} B · kernel ${interactive.stats.kernelBytes} B · bytecode ${interactive.stats.bytecodeBytes} B · ${interactive.stats.methods} methods`,
@@ -219,6 +219,25 @@ if (graphicsSample) {
     check(screenHas(hw.cpu, 'graphics demo complete'), 'graphics: hardware did not print the completion line');
     check(screenHas(hw.cpu, 'key=122'), 'graphics: hardware did not read the key');
     compareScreens(hw.cpu, vm, 'graphics after End()');
+  }
+}
+
+console.log('\n=== arrays and heap reuse on bare metal ===');
+const arraysSample = SAMPLES.find((sample) => sample.id === 'arrays');
+check(Boolean(arraysSample), 'arrays sample is missing');
+if (arraysSample) {
+  const arrays = compileProgram(arraysSample.source, arraysSample.filename);
+  check(arrays.ok, `arrays sample failed to build: ${arrays.diagnostics.map((d) => d.message).join('; ')}`);
+  if (arrays.image && arrays.compiled) {
+    const hw = boot(arrays, '');
+    check(hw.state === 'halted', 'arrays: program did not halt');
+    for (const line of ['scores total=210', 'scores length=6', 'first=Ada', 'last=Linus', 'heap reuse ok']) {
+      check(screenHas(hw.cpu, line), `arrays: missing hardware output "${line}"`);
+    }
+    const vm = runVm(arrays, [], []);
+    check(vm.state === 'halted', `arrays: VM ended in ${vm.state}`);
+    compareScreens(hw.cpu, vm.vm, 'arrays');
+    console.log('  indexed int/string arrays, helper parameter and 40 KB of recycled heap blocks');
   }
 }
 

@@ -2,7 +2,9 @@ import type { Diagnostic } from './types.ts';
 import { tokenize } from './lexer.ts';
 import type { Token } from './lexer.ts';
 
-export type TypeName = 'int' | 'double' | 'string' | 'bool' | 'char' | 'void' | 'var' | 'string[]';
+export type TypeName =
+  | 'int' | 'double' | 'string' | 'bool' | 'char' | 'void' | 'var'
+  | 'int[]' | 'string[]' | 'bool[]';
 
 export interface Param {
   name: string;
@@ -67,6 +69,7 @@ export type Expr =
   | { kind: 'cond'; cond: Expr; a: Expr; b: Expr; line: number }
   | { kind: 'interp'; parts: (string | Expr)[]; line: number }
   | { kind: 'new'; typeName: TypeName; args: Expr[]; line: number }
+  | { kind: 'newarray'; elementType: 'int' | 'string' | 'bool'; size: Expr; line: number }
   | { kind: 'cast'; type: TypeName; expr: Expr; line: number };
 
 export interface ParseResult {
@@ -439,8 +442,13 @@ class Parser {
     if (this.at('[')) {
       this.next();
       this.expect(']');
-      if (tok.value === 'string' || tok.value === 'String') return 'string[]';
-      this.fail(`Arrays of '${tok.value}' are not supported`, 'Arrays are not available in the SharpBoot subset.');
+      const base = mapType(tok.value);
+      if (base === 'int' || base === 'bool') return `${base}[]`;
+      if (base === 'string' || base === 'char') return 'string[]';
+      if (base === 'double') {
+        this.fail('double arrays are not supported on bare metal', 'Use an int[] instead.');
+      }
+      this.fail(`Arrays of '${tok.value}' are not supported`, 'Use int[], string[], bool[] or char[].');
     }
     if (this.at('<')) {
       this.fail('Generic types are not supported', 'Use plain int, double, string, bool or char values.');
@@ -591,9 +599,15 @@ class Parser {
     if (this.at('const')) return true;
     const tok = this.peek();
     if (tok.kind !== 'ident' || mapType(tok.value) === null) return false;
-    const nameTok = this.peek(1);
+    let offset = 1;
+    if (this.peek(offset).kind === 'op' && this.peek(offset).value === '[') {
+      offset++;
+      if (!(this.peek(offset).kind === 'op' && this.peek(offset).value === ']')) return false;
+      offset++;
+    }
+    const nameTok = this.peek(offset);
     if (nameTok.kind !== 'ident') return false;
-    const after = this.peek(2);
+    const after = this.peek(offset + 1);
     return after.kind === 'op' && ['=', ';', ',', ')'].includes(after.value);
   }
 
@@ -771,9 +785,26 @@ class Parser {
       }
       if (tok.value === 'new') {
         this.next();
-        const type = this.parseType();
-        if (type !== 'string') {
-          this.fail('Only new string(...) is supported');
+        const baseTok = this.peek();
+        const base = baseTok.kind === 'ident' ? mapType(baseTok.value) : null;
+        if (!base) {
+          this.fail('Expected int, string or bool after new');
+        }
+        this.next();
+        if (this.at('[')) {
+          this.next();
+          const size = this.parseExpression();
+          this.expect(']');
+          if (base === 'double') {
+            this.fail('double arrays are not supported on bare metal', 'Use an int[] instead.');
+          }
+          if (base !== 'int' && base !== 'string' && base !== 'bool') {
+            this.fail(`new ${base}[...] is not supported`);
+          }
+          return { kind: 'newarray', elementType: base, size, line: tok.line };
+        }
+        if (base !== 'string') {
+          this.fail('Only new string(...) and new int[n] are supported');
         }
         this.expect('(');
         const args: Expr[] = [];
@@ -783,7 +814,7 @@ class Parser {
           } while (this.eat(','));
         }
         this.expect(')');
-        return { kind: 'new', typeName: type, args, line: tok.line };
+        return { kind: 'new', typeName: base, args, line: tok.line };
       }
       if (tok.value === 'this' || tok.value === 'base') {
         this.fail("'this' and 'base' are not supported", 'All methods are treated as static.');

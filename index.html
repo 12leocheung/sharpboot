@@ -33,7 +33,7 @@
 
       <p class="lede">
         Drop a C# file. The engine repairs what it can, reports what it can't, compiles it to bytecode, and emits a
-        bootable image with a hand-written boot sector and kernel. The program runs on the image — loops, variables, VGA text, mode 13h graphics and BIOS keyboard input included — not as baked console text. No COSMOS, no .NET runtime.
+        bootable image with a hand-written boot sector and kernel. The program runs on the image — loops, variables, arrays, VGA text, mode 13h graphics and BIOS keyboard input included — not as baked console text. No COSMOS, no .NET runtime.
       </p>
 
       <main class="grid">
@@ -137,6 +137,73 @@
         </section>
       </main>
 
+      <section class="panel guide" id="arrays-guide">
+        <div class="panel-head">
+          <span class="panel-title">arrays + memory guide</span>
+          <span class="spacer"></span>
+          <span class="mono-dim">tagged values · indexed heap blocks · mark/sweep GC</span>
+        </div>
+        <div class="guide-body">
+          <div class="guide-copy">
+            <p class="guide-lede">
+              Arrays are first-class values in SharpBoot bytecode. The kernel allocates a tagged block on the heap,
+              zeroes it, and indexes it in constant time. Strings and arrays share the same non-leaking allocator: a
+              mark/sweep collector reclaims blocks that are no longer reachable from globals, locals, the VM stack or
+              the temporary string registers.
+            </p>
+            <table class="api-table">
+              <thead><tr><th>syntax</th><th>behavior</th></tr></thead>
+              <tbody>
+                <tr><td><code>int[] a = new int[8];</code></td><td>Allocate eight int slots, initialized to <code>0</code>.</td></tr>
+                <tr><td><code>string[] names = new string[3];</code></td><td>Allocate three string slots, initialized to <code>""</code>.</td></tr>
+                <tr><td><code>a[i]</code> / <code>a[i] = value</code></td><td>Bounds-checked indexing. Bad indexes stop with a runtime fault.</td></tr>
+                <tr><td><code>a.Length</code></td><td>Element count stored in the block header. Works for int, string and bool arrays.</td></tr>
+                <tr><td><code>void Fill(int[] values)</code></td><td>Arrays are reference values, so helper methods receive and mutate the same block.</td></tr>
+              </tbody>
+            </table>
+            <div class="guide-notes">
+              <p><strong>Memory.</strong> The heap is at <code>0x8000–0xF000</code> (28 KB). Each block has a four-byte
+                header, and the allocator splits and coalesces free blocks. When contiguous space runs out it marks
+                roots and sweeps unreachable strings and arrays, then retries the allocation.</p>
+              <p><strong>Limits.</strong> Arrays use two bytes per element plus a count word. An oversized allocation, a
+                negative size or an out-of-bounds index prints an array fault instead of corrupting the VM.</p>
+              <p><strong>No collection pauses.</strong> Collection happens only when an allocation cannot be satisfied,
+                so a program that stays below the heap limit never pays for a sweep.</p>
+            </div>
+          </div>
+          <pre class="guide-code"><code>using System;
+
+class Program
+{
+    static int Sum(int[] values)
+    {
+        int total = 0;
+        for (int i = 0; i &lt; values.Length; i++)
+        {
+            total += values[i];
+        }
+        return total;
+    }
+
+    static void Main()
+    {
+        int[] scores = new int[6];
+        for (int i = 0; i &lt; scores.Length; i++)
+        {
+            scores[i] = (i + 1) * 10;
+        }
+
+        string[] names = new string[2];
+        names[0] = "Ada";
+        names[1] = "Grace";
+
+        Console.WriteLine("total=" + Sum(scores));
+        Console.WriteLine(names[0] + " + " + names[1]);
+    }
+}</code></pre>
+        </div>
+      </section>
+
       <section class="panel guide" id="graphics-guide">
         <div class="panel-head">
           <span class="panel-title">graphics api guide</span>
@@ -165,6 +232,9 @@
                 <tr><td><code>Graphics.Line(x1, y1, x2, y2, color)</code></td><td>Bresenham line.</td></tr>
                 <tr><td><code>Graphics.FillCircle(cx, cy, r, color)</code></td><td>Filled circle using horizontal spans.</td></tr>
                 <tr><td><code>Graphics.Circle(cx, cy, r, color)</code></td><td>One-pixel circle outline.</td></tr>
+                <tr><td><code>Graphics.SetPalette(index, r, g, b)</code></td><td>Write one VGA DAC entry, 0–255 per channel. Call after <code>Init()</code>; the browser canvas uses the same palette.</td></tr>
+                <tr><td><code>Graphics.Sprite(x, y, rows, w, h)</code></td><td>Blit a string sprite. Space and <code>.</code> are transparent; <code>0–9</code> and <code>A–F</code> select palette entries 0–15.</td></tr>
+                <tr><td><code>Graphics.Text(x, y, text, color)</code></td><td>Draw an 8×8 bitmap-font string directly into the framebuffer. Lowercase is uppercased; unsupported glyphs become <code>?</code>.</td></tr>
               </tbody>
             </table>
             <div class="guide-notes">
@@ -191,6 +261,16 @@ class Program
         Graphics.Rect(20, 20, 120, 60, Graphics.Rgb(255, 255, 255));
         Graphics.Line(0, 199, 319, 0, Graphics.Rgb(255, 110, 40));
         Graphics.FillCircle(235, 106, 54, Graphics.Rgb(255, 70, 120));
+
+        for (int i = 1; i &lt; 16; i++)
+        {
+            Graphics.SetPalette(i, i * 16, 210, 255 - i * 14);
+        }
+
+        string ship = "..1111.." + ".111111." + "11111111" + "11122111"
+            + "11111111" + ".111111." + "..1..1.." + "..1..1..";
+        Graphics.Sprite(24, 108, ship, 8, 8);
+        Graphics.Text(24, 128, "SHARPBOOT SPRITE + BITMAP TEXT", 15);
 
         int key = Console.ReadKey().KeyChar;
         Graphics.End();

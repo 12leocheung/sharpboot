@@ -4,10 +4,13 @@ import { CODE_START, STRING_START } from './kernel.ts';
 import type { CompiledProgram } from './compiler.ts';
 import { Op } from './compiler.ts';
 import {
+  FONT_8X8,
   GRAPHICS_HEIGHT,
   GRAPHICS_PIXELS,
   GRAPHICS_WIDTH,
+  paletteColor,
   rgbIndex,
+  spriteColor,
 } from './graphics.ts';
 
 export type VmState = 'running' | 'waiting-line' | 'waiting-key' | 'halted' | 'error';
@@ -17,10 +20,16 @@ export interface VmCell {
   attr: number;
 }
 
-interface Val {
-  t: 0 | 1 | 2;
-  v: number | string;
+interface ArrayVal {
+  kind: 'int' | 'string' | 'bool';
+  items: Val[];
 }
+
+type Val =
+  | { t: 0; v: number }
+  | { t: 1; v: string }
+  | { t: 2; v: number }
+  | { t: 3; v: ArrayVal };
 
 interface Frame {
   returnPc: number;
@@ -39,21 +48,24 @@ function int16(value: number): number {
 
 function toNum(value: Val): number {
   if (value.t === 1) {
-    const parsed = parseIntString(String(value.v));
+    const parsed = parseIntString(value.v);
     return parsed ?? 0;
   }
-  return Number(value.v) | 0;
+  if (value.t === 3) return 0;
+  return value.v | 0;
 }
 
 function toStr(value: Val): string {
-  if (value.t === 1) return String(value.v);
-  if (value.t === 2) return Number(value.v) !== 0 ? 'True' : 'False';
-  return String(Number(value.v) | 0);
+  if (value.t === 1) return value.v;
+  if (value.t === 2) return value.v !== 0 ? 'True' : 'False';
+  if (value.t === 3) return `System.${value.v.kind === 'int' ? 'Int32' : value.v.kind === 'bool' ? 'Boolean' : 'String'}[]`;
+  return String(value.v | 0);
 }
 
 function truthy(value: Val): boolean {
-  if (value.t === 1) return String(value.v).length > 0;
-  return Number(value.v) !== 0;
+  if (value.t === 1) return value.v.length > 0;
+  if (value.t === 3) return value.v.items.length > 0;
+  return value.v !== 0;
 }
 
 function parseIntString(text: string): number | null {
@@ -155,6 +167,7 @@ export class BytecodeVm {
   private screen = new VmScreen();
   private gfxMode = false;
   private gfx = new Uint8Array(GRAPHICS_PIXELS);
+  private paletteBytes = new Uint8Array(256 * 3);
   private slots: Val[] = [];
   private bp = 1024;
   private sp = 1024;
@@ -177,6 +190,7 @@ export class BytecodeVm {
     this.readStrings();
 
     for (let i = 0; i < 4096; i++) this.slots.push(int(0));
+    this.resetPalette();
 
     this.writeText('\nSharpBoot 2.0 / 16-bit C# runtime\n\n');
 
@@ -201,6 +215,54 @@ export class BytecodeVm {
 
   graphicsPixels(): Uint8Array {
     return this.gfx.slice();
+  }
+
+  palette(): Uint8Array {
+    return this.paletteBytes;
+  }
+
+  private resetPalette(): void {
+    for (let index = 0; index < 256; index++) {
+      const [red, green, blue] = paletteColor(index);
+      this.paletteBytes[index * 3] = red;
+      this.paletteBytes[index * 3 + 1] = green;
+      this.paletteBytes[index * 3 + 2] = blue;
+    }
+  }
+
+  private gfxText(x: number, y: number, text: string, color: number): void {
+    let cx = x;
+    let cy = y;
+    for (const raw of text) {
+      if (raw === '\n') {
+        cx = x;
+        cy += 8;
+        continue;
+      }
+      if (raw === '\r') continue;
+      let code = raw.toUpperCase().charCodeAt(0);
+      if (code < 32 || code > 95) code = 63;
+      const glyph = (code - 32) * 8;
+      for (let row = 0; row < 8; row++) {
+        const bits = FONT_8X8[glyph + row] ?? 0;
+        for (let bit = 0; bit < 8; bit++) {
+          if (bits & (0x80 >> bit)) this.gfxPixel(cx + bit, cy + row, color);
+        }
+      }
+      cx += 8;
+    }
+  }
+
+  private gfxSprite(x: number, y: number, data: string, width: number, height: number): void {
+    if (width <= 0 || height <= 0) return;
+    for (let row = 0; row < height; row++) {
+      for (let col = 0; col < width; col++) {
+        const ch = data.charAt(row * width + col);
+        if (!ch) return;
+        const color = spriteColor(ch);
+        if (color >= 0) this.gfxPixel(x + col, y + row, color);
+      }
+    }
   }
 
   private writeText(text: string, attr = CP437_ATTR.normal): void {
@@ -513,7 +575,8 @@ export class BytecodeVm {
         const b = this.pop();
         const a = this.pop();
         let equal: boolean;
-        if (a.t === 1 || b.t === 1) equal = toStr(a) === toStr(b);
+        if (a.t === 3 || b.t === 3) equal = a.t === 3 && b.t === 3 && a.v === b.v;
+        else if (a.t === 1 || b.t === 1) equal = toStr(a) === toStr(b);
         else equal = toNum(a) === toNum(b);
         this.push(bool(opcode === Op.EQ ? equal : !equal));
         return;
@@ -660,12 +723,59 @@ export class BytecodeVm {
         return;
       case Op.LEN: {
         const value = this.pop();
-        if (value.t !== 1) {
+        if (value.t === 1) {
+          this.push(int(value.v.length));
+        } else if (value.t === 3) {
+          this.push(int(value.v.items.length));
+        } else {
           this.warn('wrong value type -> 0');
           this.push(int(0));
-        } else {
-          this.push(int(String(value.v).length));
         }
+        return;
+      }
+
+      case Op.NEWARR: {
+        const elementType = this.fetch16();
+        const count = toNum(this.pop());
+        if (count < 0 || count > 7000) {
+          this.fail('array allocation error');
+          return;
+        }
+        const kind = elementType === 1 ? 'string' : elementType === 2 ? 'bool' : 'int';
+        const make = (): Val => kind === 'string' ? str('') : kind === 'bool' ? bool(false) : int(0);
+        const items: Val[] = [];
+        for (let i = 0; i < count; i++) items.push(make());
+        this.push({ t: 3, v: { kind, items } });
+        return;
+      }
+      case Op.AGET: {
+        const index = toNum(this.pop());
+        const array = this.pop();
+        if (array.t !== 3) {
+          this.fail('array index on a non-array value');
+          return;
+        }
+        if (index < 0 || index >= array.v.items.length) {
+          this.fail('array index out of bounds');
+          return;
+        }
+        this.push(array.v.items[index]);
+        return;
+      }
+      case Op.ASET: {
+        const value = this.pop();
+        const index = toNum(this.pop());
+        const array = this.pop();
+        if (array.t !== 3) {
+          this.fail('array assignment on a non-array value');
+          return;
+        }
+        if (index < 0 || index >= array.v.items.length) {
+          this.fail('array index out of bounds');
+          return;
+        }
+        array.v.items[index] = value;
+        this.push(value);
         return;
       }
       case Op.PARSE: {
@@ -724,6 +834,7 @@ export class BytecodeVm {
       case Op.GINIT:
         this.gfxMode = true;
         this.gfx.fill(0);
+        this.resetPalette();
         return;
 
       case Op.GEND:
@@ -805,6 +916,48 @@ export class BytecodeVm {
         const g = toNum(this.pop());
         const r = toNum(this.pop());
         this.push(int(rgbIndex(r, g, b)));
+        return;
+      }
+
+      case Op.GPALETTE: {
+        const b = toNum(this.pop());
+        const g = toNum(this.pop());
+        const r = toNum(this.pop());
+        const index = toNum(this.pop());
+        if (index >= 0 && index < 256) {
+          this.paletteBytes[index * 3] = r & 0xff;
+          this.paletteBytes[index * 3 + 1] = g & 0xff;
+          this.paletteBytes[index * 3 + 2] = b & 0xff;
+        }
+        return;
+      }
+
+      case Op.GSPRITE: {
+        const height = toNum(this.pop());
+        const width = toNum(this.pop());
+        const data = this.pop();
+        const y = toNum(this.pop());
+        const x = toNum(this.pop());
+        if (data.t !== 1) {
+          this.warn('sprite data is not a string -> skipped');
+          return;
+        }
+        this.gfxEnsure();
+        this.gfxSprite(x, y, data.v, width, height);
+        return;
+      }
+
+      case Op.GTEXT: {
+        const color = toNum(this.pop());
+        const text = this.pop();
+        const y = toNum(this.pop());
+        const x = toNum(this.pop());
+        if (text.t !== 1) {
+          this.warn('bitmap text is not a string -> skipped');
+          return;
+        }
+        this.gfxEnsure();
+        this.gfxText(x, y, text.v, color);
         return;
       }
 

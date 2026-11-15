@@ -1,5 +1,6 @@
 import { parse } from '../src/core/parser.ts';
 import { compileToBytecode, Op } from '../src/core/compiler.ts';
+import { CODE_START } from '../src/core/kernel.ts';
 
 const source = `
 using System;
@@ -34,11 +35,11 @@ const compiled = compileToBytecode(parsed.program);
 const names = Object.fromEntries(Object.entries(Op).map(([name, value]) => [value, name])) as Record<number, string>;
 const wordOps = new Set<number>([
   Op.PUSHI, Op.PUSHS, Op.LOAD, Op.STORE, Op.LOADG, Op.STOREG,
-  Op.JMP, Op.JZ, Op.JNZ,
+  Op.JMP, Op.JZ, Op.JNZ, Op.NEWARR,
 ]);
-let pc = 0x1800;
-while (pc < 0x1800 + compiled.code.length) {
-  const offset = pc - 0x1800;
+let pc = CODE_START;
+while (pc < CODE_START + compiled.code.length) {
+  const offset = pc - CODE_START;
   const op = compiled.code[offset];
   const name = names[op] ?? `?${op}`;
   if (op === Op.CALL) {
