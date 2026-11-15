@@ -1,0 +1,19 @@
+{
+  "name": "sharpboot",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "C# source to bootable x86 image conversion engine with self-repair",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "build:pages": "tsc --noEmit && vite build --mode pages",
+    "preview": "vite preview",
+    "test": "node scripts/smoke.ts",
+    "smoke": "node scripts/smoke.ts"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "vite": "^8.3.8"
+  }
+}

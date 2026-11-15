@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SharpBoot — C# to bootable OS</title>
+    <meta
+      name="description"
+      content="Convert a C# file into a bootable 16-bit x86 floppy image. The engine repairs the source, compiles it to bytecode, and links a real boot sector, kernel and runtime that execute the program on bare metal."
+    />
+  </head>
+  <body>
+    <div class="app">
+      <header class="top">
+        <div class="brand">
+          <svg class="logo" width="34" height="34" viewBox="0 0 30 30" aria-hidden="true">
+            <rect x="0" y="0" width="13" height="13" fill="#59e3a1" />
+            <rect x="17" y="0" width="13" height="13" fill="#26384a" />
+            <rect x="0" y="17" width="13" height="13" fill="#26384a" />
+            <rect x="17" y="17" width="13" height="13" fill="#6ba6ff" />
+          </svg>
+          <div class="brand-text">
+            <h1>SHARPBOOT</h1>
+            <p>C# source → bootable x86 image</p>
+          </div>
+        </div>
+        <div class="top-right">
+          <span class="pill"><i class="led" id="engine-led"></i><span id="engine-status">ready</span></span>
+          <span class="pill">16-bit real mode</span>
+          <span class="pill">1.44 MB floppy</span>
+        </div>
+      </header>
+
+      <p class="lede">
+        Drop a C# file. The engine repairs what it can, reports what it can't, compiles it to bytecode, and emits a
+        bootable image with a hand-written boot sector and kernel. The program runs on the image — loops, variables, VGA text, mode 13h graphics and BIOS keyboard input included — not as baked console text. No COSMOS, no .NET runtime.
+      </p>
+
+      <main class="grid">
+        <section class="panel editor-panel" id="editor-panel">
+          <div class="panel-head">
+            <span class="panel-title">source</span>
+            <span class="file-chip" id="file-chip">hello.cs</span>
+            <span class="spacer"></span>
+            <button class="btn ghost" id="open-file">Open</button>
+            <button class="btn ghost" id="sample-btn" aria-expanded="false">Samples</button>
+            <button class="btn ghost" id="repair-btn" disabled>Apply repairs</button>
+          </div>
+          <div class="editor-wrap">
+            <div class="gutter" id="gutter" aria-hidden="true">1</div>
+            <textarea
+              id="editor"
+              spellcheck="false"
+              autocomplete="off"
+              autocapitalize="off"
+              wrap="off"
+              aria-label="C# source code"
+            ></textarea>
+          </div>
+          <div class="samples" id="samples" hidden></div>
+          <div class="editor-foot">
+            <span id="editor-meta">—</span>
+            <span class="drop-hint">drop a .cs file to load it</span>
+          </div>
+          <input type="file" id="file-input" accept=".cs,.txt,text/plain" hidden />
+        </section>
+
+        <section class="output">
+          <div class="panel">
+            <div class="panel-head">
+              <span class="panel-title">conversion pipeline</span>
+              <span class="spacer"></span>
+              <span class="mono-dim" id="pipeline-summary"></span>
+            </div>
+            <ol class="stages" id="stages"></ol>
+          </div>
+
+          <div class="panel">
+            <div class="panel-head">
+              <span class="panel-title">self-repair log</span>
+              <span class="spacer"></span>
+              <span class="count" id="repair-count"></span>
+            </div>
+            <div class="log" id="repair-log"></div>
+            <div class="errors" id="errors" hidden></div>
+          </div>
+
+          <div class="panel preview-panel">
+            <div class="panel-head">
+              <span class="panel-title">live boot console</span>
+              <span class="spacer"></span>
+              <span class="console-status" id="console-status">not running</span>
+              <button class="btn tiny" id="reboot" disabled>Reboot</button>
+            </div>
+            <div class="crt">
+              <div class="screen" id="screen" tabindex="0" aria-label="Live VGA text-mode console"></div>
+              <canvas id="gfx" class="gfx" width="320" height="200" hidden aria-label="Mode 13h graphics console"></canvas>
+              <div class="screen-empty" id="screen-empty" hidden>
+                <strong>conversion blocked</strong>
+                <span id="screen-empty-detail">fix the diagnostics to boot</span>
+              </div>
+            </div>
+            <div class="console-bar">
+              <span class="prompt">&gt;</span>
+              <input
+                id="stdin"
+                class="console-input"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                autofocus="false"
+                placeholder="stdin is available when the program calls ReadLine"
+                aria-label="Program standard input"
+                disabled
+              />
+              <button class="btn primary" id="send-line" disabled>Send line</button>
+            </div>
+            <p class="console-hint">
+              Same bytecode as the floppy. Type a line when the program calls <code>ReadLine</code>; when it calls
+              <code>ReadKey</code>, click the screen and press a key.
+            </p>
+            <div class="build-bar">
+              <button class="btn primary" id="download" disabled>Download .img</button>
+              <button class="btn ghost" id="copy-qemu">Copy QEMU command</button>
+              <span class="build-meta" id="build-meta">—</span>
+            </div>
+            <div class="qemu-line">
+              <span class="prompt">$</span><code id="qemu-cmd">qemu-system-i386 -fda sharpboot.img</code>
+            </div>
+            <dl class="layout" id="layout"></dl>
+            <p class="fineprint">
+              The image boots through a real BIOS floppy boot. The kernel loads the compiled bytecode from the disk and
+              executes it at runtime with a VGA text console, a mode 13h graphics framebuffer and <code>int 16h</code> keyboard input. The browser console
+              is a live VM running that same bytecode — the image is what runs on bare metal.
+            </p>
+          </div>
+        </section>
+      </main>
+
+      <section class="panel guide" id="graphics-guide">
+        <div class="panel-head">
+          <span class="panel-title">graphics api guide</span>
+          <span class="spacer"></span>
+          <span class="mono-dim">VGA mode 13h · 320 × 200 · 256 colors</span>
+          <button class="btn ghost" id="guide-demo">Load graphics demo</button>
+        </div>
+        <div class="guide-body">
+          <div class="guide-copy">
+            <p class="guide-lede">
+              SharpBoot has a small bare-metal drawing API. It switches the VGA card into mode 13h and writes straight
+              to the <code>A000:0000</code> framebuffer — no OS, no .NET drawing library and no COSMOS. The same calls
+              run in the browser VM, so the console above shows exactly what the floppy image draws.
+            </p>
+            <table class="api-table">
+              <thead><tr><th>call</th><th>result</th></tr></thead>
+              <tbody>
+                <tr><td><code>Graphics.Init()</code></td><td>Enter 320×200 mode 13h and clear to black. Drawing calls auto-start graphics if you skip this.</td></tr>
+                <tr><td><code>Graphics.End()</code></td><td>Return to 80×25 text mode and clear the text screen.</td></tr>
+                <tr><td><code>Graphics.Rgb(r, g, b)</code></td><td>Pack 0–255 RGB into a palette index. Uses 3 bits red, 3 green, 2 blue.</td></tr>
+                <tr><td><code>Graphics.Width()</code> / <code>Height()</code></td><td>Return <code>320</code> and <code>200</code>.</td></tr>
+                <tr><td><code>Graphics.Clear(color)</code></td><td>Fill the whole framebuffer.</td></tr>
+                <tr><td><code>Graphics.SetPixel(x, y, color)</code></td><td>One pixel. Top-left origin; out-of-bounds pixels are ignored.</td></tr>
+                <tr><td><code>Graphics.FillRect(x, y, w, h, color)</code></td><td>Filled rectangle, clipped to the screen.</td></tr>
+                <tr><td><code>Graphics.Rect(x, y, w, h, color)</code></td><td>One-pixel rectangle outline.</td></tr>
+                <tr><td><code>Graphics.Line(x1, y1, x2, y2, color)</code></td><td>Bresenham line.</td></tr>
+                <tr><td><code>Graphics.FillCircle(cx, cy, r, color)</code></td><td>Filled circle using horizontal spans.</td></tr>
+                <tr><td><code>Graphics.Circle(cx, cy, r, color)</code></td><td>One-pixel circle outline.</td></tr>
+              </tbody>
+            </table>
+            <div class="guide-notes">
+              <p><strong>Coordinates.</strong> <code>x</code> runs 0–319 left to right, <code>y</code> runs 0–199 top to
+                bottom. Colors are 0–255 RGB components; <code>Rgb</code> quantizes them to the 3-3-2 palette.</p>
+              <p><strong>Text and input.</strong> While graphics mode is active, text writes are suppressed so they cannot
+                corrupt the framebuffer. Call <code>Graphics.End()</code> before <code>Console.WriteLine</code>.
+                <code>Console.ReadKey().KeyChar</code> still works for game input; <code>ReadLine</code> also reads input,
+                but its echo is not visible in graphics mode.</p>
+              <p><strong>Drawing model.</strong> This is a direct framebuffer, not a retained scene or GPU API. Redraw what
+                you need each frame. There is no double buffer or vsync, so large animations may tear.</p>
+            </div>
+          </div>
+          <pre class="guide-code"><code>using System;
+
+class Program
+{
+    static void Main()
+    {
+        Graphics.Init();
+        Graphics.Clear(Graphics.Rgb(4, 10, 30));
+
+        Graphics.FillRect(20, 20, 120, 60, Graphics.Rgb(20, 210, 160));
+        Graphics.Rect(20, 20, 120, 60, Graphics.Rgb(255, 255, 255));
+        Graphics.Line(0, 199, 319, 0, Graphics.Rgb(255, 110, 40));
+        Graphics.FillCircle(235, 106, 54, Graphics.Rgb(255, 70, 120));
+
+        int key = Console.ReadKey().KeyChar;
+        Graphics.End();
+        Console.WriteLine("key=" + key);
+    }
+}</code></pre>
+        </div>
+      </section>
+    </div>
+
+    <div class="toast" id="toast" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

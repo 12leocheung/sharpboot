@@ -1,0 +1,7 @@
+node_modules/
+dist/
+.freebuff/
+.dev.log
+.dev.pid
+.tmp/
+*.local
