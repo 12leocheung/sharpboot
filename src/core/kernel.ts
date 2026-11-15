@@ -43,7 +43,7 @@ HEAP_BASE    equ 0x8000
 HEAP_MAX     equ 0xF000
 HEAP_SIZE    equ 0x7000
 BACK_SEG     equ 0x2000
-GC_ROOTS     equ 8
+GC_ROOTS     equ 12
 
 OP_HALT      equ 0
 OP_PUSHI     equ 1
@@ -113,7 +113,24 @@ OP_GSPRITEROT equ 64
 OP_GPALETTEPRESET equ 65
 OP_GSETFONT  equ 66
 OP_ACOPY     equ 67
-OP_COUNT     equ 68
+OP_NEWLIST   equ 68
+OP_LADD      equ 69
+OP_LGET      equ 70
+OP_LSET      equ 71
+OP_LCOUNT    equ 72
+OP_LREMOVEAT equ 73
+OP_LREMOVEGET equ 74
+OP_LCLEAR    equ 75
+OP_LINDEXOF  equ 76
+OP_LCONTAINS equ 77
+OP_NEWDICT   equ 78
+OP_DSET      equ 79
+OP_DGET      equ 80
+OP_DCOUNT    equ 81
+OP_DREMOVE   equ 82
+OP_DCLEAR    equ 83
+OP_DCONTAINSKEY equ 84
+OP_COUNT     equ 85
 
 ; ---------------------------------------------------------------- entry
 start:
@@ -180,6 +197,9 @@ fault_op:
   jmp fatal
 fault_array:
   mov di, msg_arr
+  jmp fatal
+fault_key:
+  mov di, msg_key
   jmp fatal
 stack_overflow:
   mov di, msg_stack
@@ -637,6 +657,10 @@ gc_mark_val:
   cmp al, 1
   je gc_mark_val_ptr
   cmp al, 3
+  je gc_mark_val_ptr
+  cmp al, 4
+  je gc_mark_val_ptr
+  cmp al, 5
   jne gc_mark_val_ret
 gc_mark_val_ptr:
   call gc_mark_ptr
@@ -658,13 +682,23 @@ gc_mark_ptr:
   cmp al, 1
   je gc_mark_ptr_obj
   cmp al, 3
+  je gc_mark_ptr_obj
+  cmp al, 4
+  je gc_mark_ptr_obj
+  cmp al, 5
   jne gc_mark_ptr_ret_pop
 gc_mark_ptr_obj:
   cmp byte [bx+3], 0
   jne gc_mark_ptr_ret_pop
   mov byte [bx+3], 1
   cmp al, 3
-  jne gc_mark_ptr_ret_pop
+  je gc_mark_array
+  cmp al, 4
+  je gc_mark_list
+  cmp al, 5
+  je gc_mark_dict
+  jmp gc_mark_ptr_ret_pop
+gc_mark_array:
   mov cx, [bx+4]
   test cx, cx
   jz gc_mark_ptr_ret_pop
@@ -680,6 +714,17 @@ gc_mark_array_next:
   add bx, 4
   dec cx
   jnz gc_mark_array_loop
+  jmp gc_mark_ptr_ret_pop
+gc_mark_list:
+  mov dx, [bx+8]
+  call gc_mark_ptr
+  jmp gc_mark_ptr_ret_pop
+gc_mark_dict:
+  mov dx, [bx+8]
+  call gc_mark_ptr
+  mov dx, [bx+10]
+  call gc_mark_ptr
+  jmp gc_mark_ptr_ret_pop
 gc_mark_ptr_ret_pop:
   pop bx
 gc_mark_ptr_ret:
@@ -2508,6 +2553,667 @@ op_acopy_done:
   pop si
   jmp run
 
+; ---------------------------------------------------------------- collections
+; CX=element count, AL=element tag -> DI=array payload
+new_array:
+  mov [tmp_len], cx
+  mov [tmp_byte], al
+  mov ax, cx
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  jc fault_array
+  mov cx, ax
+  call alloc
+  mov [tmp_dst], di
+  mov byte [di-2], 3
+  mov cx, [tmp_len]
+  mov [di], cx
+  add di, 2
+  mov al, [tmp_byte]
+  test cx, cx
+  jz new_array_done
+new_array_loop:
+  mov [di], al
+  mov byte [di+1], 0
+  mov word [di+2], 0
+  cmp al, 1
+  jne new_array_next
+  mov dx, msg_empty
+  mov [di+2], dx
+new_array_next:
+  add di, 4
+  dec cx
+  jnz new_array_loop
+new_array_done:
+  mov di, [tmp_dst]
+  ret
+
+; AL=a type, DX=a value, CL=b type, DI=b value -> AL=1 when equal
+value_eq:
+  cmp al, cl
+  jne value_eq_no
+  cmp al, 1
+  je value_eq_string
+  cmp dx, di
+  jne value_eq_no
+  mov al, 1
+  ret
+value_eq_string:
+  push bx
+  push cx
+  mov bx, dx
+  call streq
+  pop cx
+  pop bx
+  ret
+value_eq_no:
+  xor al, al
+  ret
+
+; BX=array payload, AX=index. Removes one 4-byte element.
+array_shift:
+  mov [tmp_len], ax
+  mov di, bx
+  mov ax, [tmp_len]
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add di, ax
+  mov ax, [bx]
+  sub ax, [tmp_len]
+  dec ax
+  test ax, ax
+  jle array_shift_done
+  mov cx, ax
+  push si
+  mov si, di
+  add si, 4
+  shl cx, 1
+  push es
+  push ds
+  pop es
+  cld
+  rep movsw
+  pop es
+  pop si
+array_shift_done:
+  ret
+
+; BX=list payload, AX=index -> AL/DX removed value
+list_remove:
+  mov [col_ptr], bx
+  mov [tmp_len], ax
+  mov di, [bx+4]
+  mov ax, [tmp_len]
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add di, ax
+  mov al, [di]
+  mov [col_type], al
+  mov dx, [di+2]
+  mov [col_val], dx
+  mov bx, [bx+4]
+  mov ax, [tmp_len]
+  call array_shift
+  mov bx, [col_ptr]
+  dec word [bx]
+  mov al, [col_type]
+  mov dx, [col_val]
+  ret
+
+; BX=list payload, needle in col_type/col_val -> AX=index or -1
+list_find:
+  mov word [tmp_len], 0
+  mov ax, [bx]
+  mov [col_len], ax
+  mov ax, [bx+4]
+  add ax, 2
+  mov [col_aux], ax
+list_find_loop:
+  cmp word [col_len], 0
+  je list_find_none
+  mov di, [col_aux]
+  mov cl, [di]
+  mov di, [di+2]
+  mov al, [col_type]
+  mov dx, [col_val]
+  call value_eq
+  test al, al
+  jnz list_find_hit
+  add word [col_aux], 4
+  inc word [tmp_len]
+  dec word [col_len]
+  jmp list_find_loop
+list_find_hit:
+  mov ax, [tmp_len]
+  ret
+list_find_none:
+  mov ax, -1
+  ret
+
+; BX=dict payload, key in col_key_type/col_key -> AX=index or -1
+dict_find:
+  mov word [tmp_len], 0
+  mov ax, [bx]
+  mov [col_len], ax
+  mov ax, [bx+4]
+  add ax, 2
+  mov [col_aux], ax
+dict_find_loop:
+  cmp word [col_len], 0
+  je dict_find_none
+  mov di, [col_aux]
+  mov cl, [di]
+  mov di, [di+2]
+  mov al, [col_key_type]
+  mov dx, [col_key]
+  call value_eq
+  test al, al
+  jnz dict_find_hit
+  add word [col_aux], 4
+  inc word [tmp_len]
+  dec word [col_len]
+  jmp dict_find_loop
+dict_find_hit:
+  mov ax, [tmp_len]
+  ret
+dict_find_none:
+  mov ax, -1
+  ret
+
+; Grow the key and value arrays of the dictionary in col_ptr.
+dict_grow:
+  mov bx, [col_ptr]
+  mov cx, [bx+2]
+  test cx, cx
+  jnz dict_grow_double
+  mov cx, 4
+  jmp dict_grow_alloc
+dict_grow_double:
+  shl cx, 1
+  jc fault_array
+  cmp cx, 7000
+  ja fault_array
+dict_grow_alloc:
+  mov [col_len], cx
+  mov al, [bx+8]
+  call new_array
+  mov [col_aux], di
+  mov bx, [col_ptr]
+  mov cx, [bx]
+  shl cx, 1
+  shl cx, 1
+  test cx, cx
+  jz dict_grow_keys_done
+  push si
+  mov si, [bx+4]
+  add si, 2
+  mov di, [col_aux]
+  add di, 2
+  push es
+  push ds
+  pop es
+  cld
+  rep movsw
+  pop es
+  pop si
+dict_grow_keys_done:
+  mov bx, [col_ptr]
+  mov ax, [col_aux]
+  mov [bx+4], ax
+  mov al, [bx+8]
+  mov cx, [col_len]
+  call new_array
+  mov [col_aux], di
+  mov bx, [col_ptr]
+  mov cx, [bx]
+  shl cx, 1
+  shl cx, 1
+  test cx, cx
+  jz dict_grow_vals_done
+  push si
+  mov si, [bx+6]
+  add si, 2
+  mov di, [col_aux]
+  add di, 2
+  push es
+  push ds
+  pop es
+  cld
+  rep movsw
+  pop es
+  pop si
+dict_grow_vals_done:
+  mov bx, [col_ptr]
+  mov ax, [col_aux]
+  mov [bx+6], ax
+  mov ax, [col_len]
+  mov [bx+2], ax
+  ret
+
+op_newlist:
+  mov al, [si]
+  add si, 2
+  mov [col_tag], al
+  call pop_val
+  mov [col_len], dx
+  test dx, dx
+  js fault_array
+  cmp dx, 7000
+  ja fault_array
+  mov cx, 8
+  call alloc
+  mov [col_ptr], di
+  mov byte [di-2], 4
+  mov word [di], 0
+  mov ax, [col_len]
+  mov [di+2], ax
+  mov word [di+4], 0
+  mov al, [col_tag]
+  mov [di+6], al
+  mov cx, [col_len]
+  mov al, [col_tag]
+  call new_array
+  mov bx, [col_ptr]
+  mov [bx+4], di
+  mov al, 4
+  mov dx, bx
+  call push_val
+  jmp run
+
+op_ladd:
+  call pop_val
+  mov [col_val], dx
+  mov [col_type], al
+  call pop_val
+  cmp al, 4
+  jne fault_array
+  mov [col_ptr], dx
+  mov bx, dx
+  mov ax, [bx]
+  cmp ax, [bx+2]
+  jb ladd_store
+  mov cx, [bx+2]
+  test cx, cx
+  jnz ladd_double
+  mov cx, 4
+  jmp ladd_alloc
+ladd_double:
+  shl cx, 1
+  jc fault_array
+  cmp cx, 7000
+  ja fault_array
+ladd_alloc:
+  mov [col_len], cx
+  mov al, [bx+6]
+  call new_array
+  mov [col_aux], di
+  mov bx, [col_ptr]
+  mov cx, [bx]
+  shl cx, 1
+  shl cx, 1
+  test cx, cx
+  jz ladd_copied
+  push si
+  mov si, [bx+4]
+  add si, 2
+  mov di, [col_aux]
+  add di, 2
+  push es
+  push ds
+  pop es
+  cld
+  rep movsw
+  pop es
+  pop si
+ladd_copied:
+  mov bx, [col_ptr]
+  mov ax, [col_aux]
+  mov [bx+4], ax
+  mov ax, [col_len]
+  mov [bx+2], ax
+ladd_store:
+  mov bx, [col_ptr]
+  mov ax, [bx]
+  mov di, [bx+4]
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add di, ax
+  mov al, [col_type]
+  mov [di], al
+  mov ax, [col_val]
+  mov [di+2], ax
+  inc word [bx]
+  jmp run
+
+op_lget:
+  call pop_val
+  mov [tmp_len], dx
+  call pop_val
+  cmp al, 4
+  jne fault_array
+  mov bx, dx
+  mov ax, [tmp_len]
+  test ax, ax
+  js fault_array
+  cmp ax, [bx]
+  jae fault_array
+  mov di, [bx+4]
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add di, ax
+  mov al, [di]
+  mov dx, [di+2]
+  call push_val
+  jmp run
+
+op_lset:
+  call pop_val
+  mov [col_type], al
+  mov [col_val], dx
+  call pop_val
+  mov [tmp_len], dx
+  call pop_val
+  cmp al, 4
+  jne fault_array
+  mov bx, dx
+  mov ax, [tmp_len]
+  test ax, ax
+  js fault_array
+  cmp ax, [bx]
+  jae fault_array
+  mov di, [bx+4]
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add di, ax
+  mov al, [col_type]
+  mov [di], al
+  mov dx, [col_val]
+  mov [di+2], dx
+  mov al, [col_type]
+  mov dx, [col_val]
+  call push_val
+  jmp run
+
+op_lcount:
+  call pop_val
+  cmp al, 4
+  jne fault_array
+  mov bx, dx
+  mov dx, [bx]
+  xor al, al
+  call push_val
+  jmp run
+
+op_lremoveat:
+  call pop_val
+  mov [tmp_len], dx
+  call pop_val
+  cmp al, 4
+  jne fault_array
+  mov bx, dx
+  mov ax, [tmp_len]
+  test ax, ax
+  js fault_array
+  cmp ax, [bx]
+  jae fault_array
+  call list_remove
+  jmp run
+
+op_lremoveget:
+  call pop_val
+  mov [tmp_len], dx
+  call pop_val
+  cmp al, 4
+  jne fault_array
+  mov bx, dx
+  mov ax, [tmp_len]
+  test ax, ax
+  js fault_array
+  cmp ax, [bx]
+  jae fault_array
+  call list_remove
+  call push_val
+  jmp run
+
+op_lclear:
+  call pop_val
+  cmp al, 4
+  jne fault_array
+  mov bx, dx
+  mov word [bx], 0
+  jmp run
+
+op_lindexof:
+  mov byte [col_tag], 0
+  jmp op_lsearch
+op_lcontains:
+  mov byte [col_tag], 1
+op_lsearch:
+  call pop_val
+  mov [col_val], dx
+  mov [col_type], al
+  call pop_val
+  cmp al, 4
+  jne fault_array
+  mov bx, dx
+  call list_find
+  cmp byte [col_tag], 0
+  jne op_lsearch_bool
+  mov dx, ax
+  xor al, al
+  call push_val
+  jmp run
+op_lsearch_bool:
+  xor dx, dx
+  cmp ax, -1
+  je op_lsearch_false
+  inc dx
+op_lsearch_false:
+  mov al, 2
+  call push_val
+  jmp run
+
+op_newdict:
+  mov ax, [si]
+  add si, 2
+  mov [col_tag], al
+  mov [col_type], ah
+  call pop_val
+  mov [col_len], dx
+  test dx, dx
+  js fault_array
+  cmp dx, 7000
+  ja fault_array
+  mov cx, 12
+  call alloc
+  mov [col_ptr], di
+  mov byte [di-2], 5
+  mov word [di], 0
+  mov ax, [col_len]
+  mov [di+2], ax
+  mov word [di+4], 0
+  mov word [di+6], 0
+  mov al, [col_tag]
+  mov [di+8], al
+  mov al, [col_type]
+  mov [di+10], al
+  mov cx, [col_len]
+  mov al, [col_tag]
+  call new_array
+  mov bx, [col_ptr]
+  mov [bx+4], di
+  mov cx, [col_len]
+  mov al, [col_type]
+  call new_array
+  mov bx, [col_ptr]
+  mov [bx+6], di
+  mov al, 5
+  mov dx, bx
+  call push_val
+  jmp run
+
+op_dset:
+  call pop_val
+  mov [col_val], dx
+  mov [col_type], al
+  call pop_val
+  mov [col_key], dx
+  mov [col_key_type], al
+  call pop_val
+  cmp al, 5
+  jne fault_array
+  mov [col_ptr], dx
+  mov bx, dx
+  call dict_find
+  cmp ax, -1
+  je dset_append
+  mov bx, [col_ptr]
+  mov di, [bx+6]
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add di, ax
+  mov al, [col_type]
+  mov [di], al
+  mov dx, [col_val]
+  mov [di+2], dx
+  jmp dset_push
+dset_append:
+  mov bx, [col_ptr]
+  mov ax, [bx]
+  cmp ax, [bx+2]
+  jb dset_space
+  call dict_grow
+  mov bx, [col_ptr]
+  mov ax, [bx]
+dset_space:
+  mov di, [bx+4]
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add di, ax
+  mov al, [col_key_type]
+  mov [di], al
+  mov dx, [col_key]
+  mov [di+2], dx
+  mov bx, [col_ptr]
+  mov ax, [bx]
+  mov di, [bx+6]
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add di, ax
+  mov al, [col_type]
+  mov [di], al
+  mov dx, [col_val]
+  mov [di+2], dx
+  mov bx, [col_ptr]
+  inc word [bx]
+dset_push:
+  mov al, [col_type]
+  mov dx, [col_val]
+  call push_val
+  jmp run
+
+op_dget:
+  call pop_val
+  mov [col_key], dx
+  mov [col_key_type], al
+  call pop_val
+  cmp al, 5
+  jne fault_array
+  mov [col_ptr], dx
+  mov bx, dx
+  call dict_find
+  cmp ax, -1
+  je fault_key
+  mov bx, [col_ptr]
+  mov di, [bx+6]
+  shl ax, 1
+  shl ax, 1
+  add ax, 2
+  add di, ax
+  mov al, [di]
+  mov dx, [di+2]
+  call push_val
+  jmp run
+
+op_dcount:
+  call pop_val
+  cmp al, 5
+  jne fault_array
+  mov bx, dx
+  mov dx, [bx]
+  xor al, al
+  call push_val
+  jmp run
+
+op_dremove:
+  call pop_val
+  mov [col_key], dx
+  mov [col_key_type], al
+  call pop_val
+  cmp al, 5
+  jne fault_array
+  mov [col_ptr], dx
+  mov bx, dx
+  call dict_find
+  cmp ax, -1
+  je dremove_no
+  mov [col_len], ax
+  mov bx, [col_ptr]
+  mov bx, [bx+4]
+  mov ax, [col_len]
+  call array_shift
+  mov bx, [col_ptr]
+  mov bx, [bx+6]
+  mov ax, [col_len]
+  call array_shift
+  mov bx, [col_ptr]
+  dec word [bx]
+  mov al, 2
+  mov dx, 1
+  call push_val
+  jmp run
+dremove_no:
+  xor dx, dx
+  mov al, 2
+  call push_val
+  jmp run
+
+op_dclear:
+  call pop_val
+  cmp al, 5
+  jne fault_array
+  mov bx, dx
+  mov word [bx], 0
+  jmp run
+
+op_dcontainskey:
+  call pop_val
+  mov [col_key], dx
+  mov [col_key_type], al
+  call pop_val
+  cmp al, 5
+  jne fault_array
+  mov [col_ptr], dx
+  mov bx, dx
+  call dict_find
+  xor dx, dx
+  cmp ax, -1
+  je dcontainskey_false
+  inc dx
+dcontainskey_false:
+  mov al, 2
+  call push_val
+  jmp run
+
 op_gpalette:
   call pop_val
   mov [gfx_b], dl
@@ -3081,6 +3787,8 @@ jt:
   dw op_newarr, op_aget, op_aset, op_gpalette, op_gsprite, op_gtext
   dw op_gbegin, op_gpresent, op_gendbuf, op_gsprscale, op_gsprrot
   dw op_gpalettepreset, op_gsetfont, op_acopy
+  dw op_newlist, op_ladd, op_lget, op_lset, op_lcount, op_lremoveat, op_lremoveget, op_lclear
+  dw op_lindexof, op_lcontains, op_newdict, op_dset, op_dget, op_dcount, op_dremove, op_dclear, op_dcontainskey
 
 ; ---------------------------------------------------------------- data
 row:        dw 0
@@ -3091,6 +3799,7 @@ vsp:        dw 0
 heap:       dw 0
 gc_retry:   db 0
 gc_roots:   dw a_val, b_val, c_val, tmp_ptr, tmp_dst, in_ptr, pv_val, gfx_font_owner
+            dw col_ptr, col_key, col_val, col_aux
 a_type:     db 0
 a_val:      dw 0
 a_len:      dw 0
@@ -3102,6 +3811,14 @@ pv_val:     dw 0
 tmp_ptr:    dw 0
 tmp_dst:    dw 0
 tmp_byte:   db 0
+col_ptr:    dw 0
+col_key:    dw 0
+col_val:    dw 0
+col_aux:    dw 0
+col_type:   db 0
+col_key_type: db 0
+col_tag:    db 0
+col_len:    dw 0
 numlen:     dw 0
 had_digit:  db 0
 case_mode:  db 0
@@ -3173,6 +3890,7 @@ msg_strord: msg "\n[repair] string ordering is unsupported -> false\n"
 msg_esc:    msg "\n[halted by ESC]\n"
 msg_oom:    msg "\n[fatal] heap exhausted\n"
 msg_arr:    msg "\n[fatal] array index or allocation error\n"
+msg_key:    msg "\n[fatal] dictionary key not found\n"
 msg_font:   msg "\n[repair] custom font needs 760 bytes -> ignored\n"
 msg_stack:  msg "\n[fatal] VM stack overflow\n"
 msg_code:   msg "\n[fatal] bytecode overrun\n"

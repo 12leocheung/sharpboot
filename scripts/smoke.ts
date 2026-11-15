@@ -294,6 +294,110 @@ if (arrayFeature.image && arrayFeature.compiled) {
   console.log('  initializers, double[]/char[] aliases, foreach and Array.Copy match the VM');
 }
 
+console.log('\n=== generic collections on bare metal ===');
+const collectionFeatureSource = `using System;
+using System.Collections.Generic;
+
+class Program
+{
+    static List<int> Values = new List<int>();
+
+    static void Fill(List<int> list, int count)
+    {
+        for (int i = 0; i < count; i++) list.Add(i);
+    }
+
+    static List<int> MakeList(int count)
+    {
+        List<int> list = new List<int>(2);
+        Fill(list, count);
+        return list;
+    }
+
+    static void Main()
+    {
+        List<string> words = new List<string>();
+        words.Add("zero");
+        words.Add("one");
+        words.Add("two");
+        words.Add("three");
+        words.Add("four");
+        words.Add("five");
+        Console.WriteLine("words=" + words.Count + "," + words[0] + "," + words[5]);
+        words.RemoveAt(2);
+        Console.WriteLine("removed=" + words[2] + "," + words.Count);
+        Console.WriteLine("has=" + words.Contains("four") + "," + words.IndexOf("five"));
+
+        Dictionary<int,string> map = new Dictionary<int,string>();
+        for (int i = 0; i < 8; i++) map[i] = "v" + i;
+        Console.WriteLine("map=" + map.Count + "," + map[0] + "," + map[7]);
+        map[3] = "changed";
+        Console.WriteLine("changed=" + map[3]);
+        map.Remove(5);
+        Console.WriteLine("map2=" + map.Count + "," + map.ContainsKey(5));
+
+        Dictionary<string,int> counts = new Dictionary<string,int>();
+        counts["a"] = 1;
+        counts["b"] = 2;
+        counts["a"] = counts["a"] + 10;
+        Console.WriteLine("counts=" + counts["a"] + "," + counts["b"] + "," + counts.Count);
+
+        List<int> big = MakeList(20);
+        Values = big;
+        Console.WriteLine("big=" + big.Count + "," + big[0] + "," + big[19]);
+        Console.WriteLine("field=" + Values.Count);
+        int sum = 0;
+        foreach (int n in big) sum += n;
+        Console.WriteLine("foreach=" + sum);
+
+        int total = 0;
+        for (int round = 0; round < 70; round++)
+        {
+            List<int> temp = new List<int>();
+            for (int j = 0; j < 16; j++) temp.Add(j + round);
+            total = total + temp[0] + temp[15];
+        }
+        Console.WriteLine("gc=" + total + "," + big[19] + "," + words[0]);
+
+        Queue<int> queue = new Queue<int>();
+        queue.Enqueue(1);
+        queue.Enqueue(2);
+        Console.WriteLine("queue=" + queue.Dequeue() + "," + queue.Peek());
+        Stack<int> stack = new Stack<int>();
+        stack.Push(10);
+        stack.Push(20);
+        Console.WriteLine("stack=" + stack.Pop() + "," + stack.Peek());
+    }
+}
+`;
+const collectionFeature = compileProgram(collectionFeatureSource, 'collections.cs');
+check(collectionFeature.ok, `generic collections failed to build: ${collectionFeature.diagnostics.map((d) => d.message).join('; ')}`);
+if (collectionFeature.image && collectionFeature.compiled) {
+  const hw = boot(collectionFeature, '');
+  check(hw.state === 'halted', 'generic collections did not halt');
+  for (const line of [
+    'words=6,zero,five',
+    'removed=three,5',
+    'has=True,4',
+    'map=8,v0,v7',
+    'changed=changed',
+    'map2=7,False',
+    'counts=11,2,2',
+    'big=20,0,19',
+    'field=20',
+    'foreach=190',
+    'gc=5880,19,zero',
+    'queue=1,2',
+    'stack=20,10',
+  ]) {
+    check(screenHas(hw.cpu, line), `generic collections: missing hardware output "${line}"`);
+  }
+  const vm = runVm(collectionFeature, [], []);
+  check(vm.state === 'halted', `generic collections: VM ended in ${vm.state}`);
+  compareScreens(hw.cpu, vm.vm, 'generic collections');
+  console.log('  List<T>, Dictionary<K,V>, Queue<T>, Stack<T>, methods and GC match the VM');
+}
+
 console.log('\n=== buffers, presets, transformed sprites and custom fonts ===');
 const customFont = 'A'.repeat(760);
 const graphicsFeatureSource = `using System;

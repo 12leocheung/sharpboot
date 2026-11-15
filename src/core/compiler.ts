@@ -7,7 +7,7 @@
  */
 
 import type { Diagnostic } from './types.ts';
-import type { Expr, MethodDecl, Program, Stmt, TypeName } from './parser.ts';
+import type { CollectionTypeName, Expr, MethodDecl, Program, Stmt, TypeName } from './parser.ts';
 import { findEntry, flatMethods } from './parser.ts';
 import {
   CODE_START,
@@ -87,26 +87,85 @@ export const Op = {
   GPALETTEPRESET: 65,
   GSETFONT: 66,
   ACOPY: 67,
+  NEWLIST: 68,
+  LADD: 69,
+  LGET: 70,
+  LSET: 71,
+  LCOUNT: 72,
+  LREMOVEAT: 73,
+  LREMOVEGET: 74,
+  LCLEAR: 75,
+  LINDEXOF: 76,
+  LCONTAINS: 77,
+  NEWDICT: 78,
+  DSET: 79,
+  DGET: 80,
+  DCOUNT: 81,
+  DREMOVE: 82,
+  DCLEAR: 83,
+  DCONTAINSKEY: 84,
 } as const;
 
 export type Op = (typeof Op)[keyof typeof Op];
 
-export const OPCODE_COUNT = 68;
+export const OPCODE_COUNT = 85;
 
 type ArrayElement = 'int' | 'string' | 'bool';
 type ArrayType = 'int[]' | 'string[]' | 'bool[]';
-type VType = 'int' | 'string' | 'bool' | 'void' | ArrayType;
+type ListType = `List<${ArrayElement}>`;
+type QueueType = `Queue<${ArrayElement}>`;
+type StackType = `Stack<${ArrayElement}>`;
+type DictionaryType = `Dictionary<${ArrayElement},${ArrayElement}>`;
+type VType = 'int' | 'string' | 'bool' | 'void' | ArrayType | CollectionTypeName;
 
 function isArrayType(type: VType): type is ArrayType {
   return type === 'int[]' || type === 'string[]' || type === 'bool[]';
+}
+
+function isListType(type: VType): type is ListType {
+  return type.startsWith('List<');
+}
+
+function isQueueType(type: VType): type is QueueType {
+  return type.startsWith('Queue<');
+}
+
+function isStackType(type: VType): type is StackType {
+  return type.startsWith('Stack<');
+}
+
+function isListLike(type: VType): type is ListType | QueueType | StackType {
+  return isListType(type) || isQueueType(type) || isStackType(type);
+}
+
+function isDictionaryType(type: VType): type is DictionaryType {
+  return type.startsWith('Dictionary<');
+}
+
+function isCollectionType(type: VType): type is CollectionTypeName {
+  return isListLike(type) || isDictionaryType(type);
 }
 
 function arrayElement(type: ArrayType): ArrayElement {
   return type.slice(0, -2) as ArrayElement;
 }
 
+function collectionElement(type: ListType | QueueType | StackType): ArrayElement {
+  return type.slice(type.indexOf('<') + 1, -1) as ArrayElement;
+}
+
+function dictionaryElements(type: DictionaryType): [ArrayElement, ArrayElement] {
+  const [key, value] = type.slice(type.indexOf('<') + 1, -1).split(',');
+  return [key as ArrayElement, value as ArrayElement];
+}
+
 function elementTag(type: ArrayElement): number {
   return type === 'string' ? 1 : type === 'bool' ? 2 : 0;
+}
+
+function dictionaryTag(type: DictionaryType): number {
+  const [key, value] = dictionaryElements(type);
+  return elementTag(key) | (elementTag(value) << 8);
 }
 
 interface GlobalVar {
@@ -513,11 +572,25 @@ class Compiler {
 
       case 'foreach': {
         const iterableType = this.compileExpr(stmt.iterable);
-        if (!isArrayType(iterableType)) {
-          this.error('foreach currently requires an array', stmt.line, 'Use int[], string[], bool[] or char[].');
+        let elementType: ArrayElement;
+        let lengthOp: Op;
+        let getOp: Op;
+        if (isArrayType(iterableType)) {
+          elementType = arrayElement(iterableType);
+          lengthOp = Op.LEN;
+          getOp = Op.AGET;
+        } else if (isListLike(iterableType)) {
+          elementType = collectionElement(iterableType);
+          lengthOp = Op.LCOUNT;
+          getOp = Op.LGET;
+        } else {
+          this.error(
+            'foreach requires an array, List<T>, Queue<T> or Stack<T>',
+            stmt.line,
+            'Use int[], string[], bool[], a List, Queue or Stack.',
+          );
           return;
         }
-        const elementType = arrayElement(iterableType);
         const temp = this.tempCounter++;
         const arraySlot = this.declareLocal(`__foreach_array_${temp}`, iterableType);
         const indexSlot = this.declareLocal(`__foreach_index_${temp}`, 'int');
@@ -527,12 +600,12 @@ class Compiler {
         const start = this.here();
         this.emitPair(Op.LOAD, indexSlot);
         this.emitPair(Op.LOAD, arraySlot);
-        this.emit(Op.LEN);
+        this.emit(lengthOp);
         this.emit(Op.LT);
         const endJump = this.emitJump(Op.JZ);
         this.emitPair(Op.LOAD, arraySlot);
         this.emitPair(Op.LOAD, indexSlot);
-        this.emit(Op.AGET);
+        this.emit(getOp);
         this.fn?.breaks.push([]);
         this.fn?.continues.push([]);
         this.pushScope();
@@ -778,9 +851,20 @@ class Compiler {
       case 'index': {
         const objectType = this.compileExpr(expr.object);
         const indexType = this.compileExpr(expr.index);
+        if (isListType(objectType)) {
+          this.coerce(indexType, 'int', expr.line);
+          this.emit(Op.LGET);
+          return collectionElement(objectType);
+        }
+        if (isDictionaryType(objectType)) {
+          const [keyType, valueType] = dictionaryElements(objectType);
+          this.coerce(indexType, keyType, expr.line);
+          this.emit(Op.DGET);
+          return valueType;
+        }
         this.coerce(indexType, 'int', expr.line);
         if (!isArrayType(objectType)) {
-          this.error('Only arrays can be indexed', expr.line, 'Create the value with new int[n], then index it.');
+          this.error('Only arrays, List<T> and Dictionary<K,V> can be indexed', expr.line, 'Create the value with new int[n], a List or a Dictionary.');
           this.emitWord(Op.PUSHI, 0);
           return 'int';
         }
@@ -834,14 +918,34 @@ class Compiler {
         return `${expr.elementType}[]`;
       }
 
-      case 'new':
+      case 'new': {
+        const createdType = expr.typeName as VType;
+        if (isListLike(createdType)) {
+          if (expr.args.length > 1) {
+            this.error('Collection constructors take only an optional capacity', expr.line);
+          }
+          if (expr.args[0]) this.coerce(this.compileExpr(expr.args[0]), 'int', expr.line);
+          else this.emitWord(Op.PUSHI, 0);
+          this.emitPair(Op.NEWLIST, elementTag(collectionElement(createdType)));
+          return createdType;
+        }
+        if (isDictionaryType(createdType)) {
+          if (expr.args.length > 1) {
+            this.error('Dictionary constructors take only an optional capacity', expr.line);
+          }
+          if (expr.args[0]) this.coerce(this.compileExpr(expr.args[0]), 'int', expr.line);
+          else this.emitWord(Op.PUSHI, 0);
+          this.emitPair(Op.NEWDICT, dictionaryTag(createdType));
+          return createdType;
+        }
         this.error(
-          '`new string(...)` is not available in this kernel',
+          `new ${expr.typeName}(...) is not available in this kernel`,
           expr.line,
-          'Assign a string literal or build the text with + / concatenation.',
+          'Use new int[n], new List<T>(...) or new Dictionary<K,V>(...).',
         );
         this.emitString('');
         return 'string';
+      }
 
       default:
         this.error('Unsupported expression');
@@ -969,9 +1073,34 @@ class Compiler {
     if (expr.target.kind === 'index') {
       const objectType = this.compileExpr(expr.target.object);
       const indexType = this.compileExpr(expr.target.index);
+      if (isListType(objectType)) {
+        this.coerce(indexType, 'int', expr.line);
+        const elementType = collectionElement(objectType);
+        if (expr.op !== '=') {
+          this.error('List elements only support plain = assignment', expr.line, 'Use list[i] = list[i] + value.');
+          this.compileExpr(expr.value);
+          return elementType;
+        }
+        const valueType = this.compileExpr(expr.value);
+        this.coerce(valueType, elementType, expr.line);
+        this.emit(Op.LSET);
+        return elementType;
+      }
+      if (isDictionaryType(objectType)) {
+        const [keyType, valueType] = dictionaryElements(objectType);
+        this.coerce(indexType, keyType, expr.line);
+        if (expr.op !== '=') {
+          this.error('Dictionary values only support plain = assignment', expr.line, 'Read the value, change it, then assign it back.');
+          this.compileExpr(expr.value);
+          return valueType;
+        }
+        this.coerce(this.compileExpr(expr.value), valueType, expr.line);
+        this.emit(Op.DSET);
+        return valueType;
+      }
       this.coerce(indexType, 'int', expr.line);
       if (!isArrayType(objectType)) {
-        this.error('Only arrays can be indexed', expr.line);
+        this.error('Only arrays, List<T> and Dictionary<K,V> can be indexed', expr.line);
         this.compileExpr(expr.value);
         return 'int';
       }
@@ -1035,6 +1164,15 @@ class Compiler {
       if (owner === 'string' || owner === 'String') return this.stringCall(callee.name, call.args, call.line);
       if (owner === 'Convert') return this.convertCall(callee.name, call.args, call.line);
       if (owner === 'Array') return this.arrayCall(callee.name, call.args, call.line);
+      if (callee.object.kind === 'ident') {
+        const local = this.lookupLocal(callee.object.name);
+        const global = local ? undefined : this.globalByName.get(callee.object.name);
+        const objectType = local?.type ?? global?.type;
+        if (objectType && isCollectionType(objectType)) {
+          this.compileExpr(callee.object);
+          return this.collectionCall(objectType, callee.name, call.args, call.line);
+        }
+      }
       if (owner && this.globalByQualified.has(`${owner}.${callee.name}`)) {
         this.error(`Static field '${callee.name}' is not a method`, call.line);
       }
@@ -1043,6 +1181,9 @@ class Compiler {
       }
 
       const objectType = this.compileExpr(callee.object);
+      if (isCollectionType(objectType)) {
+        return this.collectionCall(objectType, callee.name, call.args, call.line);
+      }
       if (callee.name === 'ToString') {
         this.coerce(objectType, 'string', call.line);
         this.emit(Op.TOSTR);
@@ -1067,6 +1208,115 @@ class Compiler {
     this.error('Unsupported call expression', call.line);
     this.emitWord(Op.PUSHI, 0);
     return 'int';
+  }
+
+  private collectionCall(objectType: CollectionTypeName, name: string, args: Expr[], line: number): VType {
+    if (isDictionaryType(objectType)) {
+      const [keyType, valueType] = dictionaryElements(objectType);
+      if (name === 'Add') {
+        if (args.length !== 2) this.error('Dictionary.Add expects a key and a value', line);
+        if (args[0]) this.coerce(this.compileExpr(args[0]), keyType, line);
+        else this.emitDefault(keyType);
+        if (args[1]) this.coerce(this.compileExpr(args[1]), valueType, line);
+        else this.emitDefault(valueType);
+        this.emit(Op.DSET);
+        this.emit(Op.POP);
+        return 'void';
+      }
+      if (name === 'ContainsKey') {
+        if (args.length !== 1) this.error('Dictionary.ContainsKey expects a key', line);
+        if (args[0]) this.coerce(this.compileExpr(args[0]), keyType, line);
+        else this.emitDefault(keyType);
+        this.emit(Op.DCONTAINSKEY);
+        return 'bool';
+      }
+      if (name === 'Remove') {
+        if (args.length !== 1) this.error('Dictionary.Remove expects a key', line);
+        if (args[0]) this.coerce(this.compileExpr(args[0]), keyType, line);
+        else this.emitDefault(keyType);
+        this.emit(Op.DREMOVE);
+        return 'bool';
+      }
+      if (name === 'Clear') {
+        if (args.length !== 0) this.error('Dictionary.Clear takes no arguments', line);
+        this.emit(Op.DCLEAR);
+        return 'void';
+      }
+      this.error(
+        `Dictionary method '${name}' is not supported`,
+        line,
+        'Supported: Add, ContainsKey, Remove, Clear and the [key] indexer.',
+      );
+      return 'void';
+    }
+
+    const elementType = collectionElement(objectType);
+    if (name === 'Add' || name === 'Enqueue' || name === 'Push') {
+      if (args.length !== 1) this.error(`${name} expects one value`, line);
+      if (args[0]) this.coerce(this.compileExpr(args[0]), elementType, line);
+      else this.emitDefault(elementType);
+      this.emit(Op.LADD);
+      return 'void';
+    }
+    if (name === 'Dequeue') {
+      if (args.length !== 0) this.error('Dequeue takes no arguments', line);
+      this.emitWord(Op.PUSHI, 0);
+      this.emit(Op.LREMOVEGET);
+      return elementType;
+    }
+    if (name === 'Pop') {
+      if (args.length !== 0) this.error('Pop takes no arguments', line);
+      this.emitStackTopIndex();
+      this.emit(Op.LREMOVEGET);
+      return elementType;
+    }
+    if (name === 'Peek') {
+      if (args.length !== 0) this.error('Peek takes no arguments', line);
+      if (isStackType(objectType)) this.emitStackTopIndex();
+      else this.emitWord(Op.PUSHI, 0);
+      this.emit(Op.LGET);
+      return elementType;
+    }
+    if (name === 'RemoveAt') {
+      if (args.length !== 1) this.error('RemoveAt expects an index', line);
+      if (args[0]) this.coerce(this.compileExpr(args[0]), 'int', line);
+      else this.emitWord(Op.PUSHI, 0);
+      this.emit(Op.LREMOVEAT);
+      return 'void';
+    }
+    if (name === 'Clear') {
+      if (args.length !== 0) this.error('Clear takes no arguments', line);
+      this.emit(Op.LCLEAR);
+      return 'void';
+    }
+    if (name === 'Contains') {
+      if (args.length !== 1) this.error('Contains expects one value', line);
+      if (args[0]) this.coerce(this.compileExpr(args[0]), elementType, line);
+      else this.emitDefault(elementType);
+      this.emit(Op.LCONTAINS);
+      return 'bool';
+    }
+    if (name === 'IndexOf') {
+      if (args.length !== 1) this.error('IndexOf expects one value', line);
+      if (args[0]) this.coerce(this.compileExpr(args[0]), elementType, line);
+      else this.emitDefault(elementType);
+      this.emit(Op.LINDEXOF);
+      return 'int';
+    }
+    this.error(
+      `Collection method '${name}' is not supported`,
+      line,
+      'Supported: Add/Push/Enqueue, RemoveAt, Clear, Contains, IndexOf, Count, indexing and foreach.',
+    );
+    return 'void';
+  }
+
+  /** Stack: duplicate the collection, load Count, and leave Count - 1 on the stack. */
+  private emitStackTopIndex(): void {
+    this.emit(Op.DUP);
+    this.emit(Op.LCOUNT);
+    this.emitWord(Op.PUSHI, 1);
+    this.emit(Op.SUB);
   }
 
   private arrayCall(name: string, args: Expr[], line: number): VType {
@@ -1368,6 +1618,19 @@ class Compiler {
       return this.compileExpr(expr.object);
     }
     const objectType = this.compileExpr(expr.object);
+    if (expr.name === 'Count') {
+      if (isListLike(objectType)) {
+        this.emit(Op.LCOUNT);
+        return 'int';
+      }
+      if (isDictionaryType(objectType)) {
+        this.emit(Op.DCOUNT);
+        return 'int';
+      }
+      this.error('Count is only available on collections', expr.line);
+      this.emitWord(Op.PUSHI, 0);
+      return 'int';
+    }
     if (expr.name === 'Length') {
       if (!isArrayType(objectType)) this.coerce(objectType, 'string', expr.line);
       this.emit(Op.LEN);
@@ -1451,6 +1714,16 @@ class Compiler {
       this.emitPair(Op.NEWARR, elementTag(arrayElement(type)));
       return;
     }
+    if (isListLike(type)) {
+      this.emitWord(Op.PUSHI, 0);
+      this.emitPair(Op.NEWLIST, elementTag(collectionElement(type)));
+      return;
+    }
+    if (isDictionaryType(type)) {
+      this.emitWord(Op.PUSHI, 0);
+      this.emitPair(Op.NEWDICT, dictionaryTag(type));
+      return;
+    }
     this.emitWord(Op.PUSHI, 0);
   }
 
@@ -1499,6 +1772,14 @@ class Compiler {
     }
     if (isArrayType(to) || isArrayType(from)) {
       this.error(`Cannot convert ${from} to ${to}`, line, 'Arrays keep their element type.');
+      return;
+    }
+    if (isCollectionType(to) || isCollectionType(from)) {
+      this.error(
+        `Cannot convert ${from} to ${to}`,
+        line,
+        'Collections keep their element and key/value types.',
+      );
       return;
     }
     if (to === 'string') {

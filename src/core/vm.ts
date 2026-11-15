@@ -20,16 +20,38 @@ export interface VmCell {
   attr: number;
 }
 
+type ValueKind = 'int' | 'string' | 'bool';
+
 interface ArrayVal {
-  kind: 'int' | 'string' | 'bool';
+  kind: ValueKind;
   items: Val[];
+}
+
+interface ListVal {
+  kind: 'list';
+  element: ValueKind;
+  items: Val[];
+}
+
+interface DictEntry {
+  key: Val;
+  value: Val;
+}
+
+interface DictVal {
+  kind: 'dict';
+  keyKind: ValueKind;
+  valueKind: ValueKind;
+  entries: DictEntry[];
 }
 
 type Val =
   | { t: 0; v: number }
   | { t: 1; v: string }
   | { t: 2; v: number }
-  | { t: 3; v: ArrayVal };
+  | { t: 3; v: ArrayVal }
+  | { t: 4; v: ListVal }
+  | { t: 5; v: DictVal };
 
 interface Frame {
   returnPc: number;
@@ -41,6 +63,21 @@ const int = (value: number): Val => ({ t: 0, v: int16(value) });
 const bool = (value: boolean): Val => ({ t: 2, v: value ? 1 : 0 });
 const str = (value: string): Val => ({ t: 1, v: value });
 
+function kindFromTag(tag: number): ValueKind {
+  return tag === 1 ? 'string' : tag === 2 ? 'bool' : 'int';
+}
+
+function valuesEqual(a: Val, b: Val): boolean {
+  if (a.t !== b.t) return false;
+  if (a.t === 1 && b.t === 1) return a.v === b.v;
+  if (a.t === 2 && b.t === 2) return a.v === b.v;
+  if (a.t === 0 && b.t === 0) return a.v === b.v;
+  if (a.t === 3 && b.t === 3) return a.v === b.v;
+  if (a.t === 4 && b.t === 4) return a.v === b.v;
+  if (a.t === 5 && b.t === 5) return a.v === b.v;
+  return false;
+}
+
 function int16(value: number): number {
   const wrapped = ((value + 32768) % 65536 + 65536) % 65536 - 32768;
   return wrapped | 0;
@@ -51,20 +88,24 @@ function toNum(value: Val): number {
     const parsed = parseIntString(value.v);
     return parsed ?? 0;
   }
-  if (value.t === 3) return 0;
-  return value.v | 0;
+  if (value.t === 0 || value.t === 2) return value.v | 0;
+  return 0;
 }
 
 function toStr(value: Val): string {
   if (value.t === 1) return value.v;
   if (value.t === 2) return value.v !== 0 ? 'True' : 'False';
   if (value.t === 3) return `System.${value.v.kind === 'int' ? 'Int32' : value.v.kind === 'bool' ? 'Boolean' : 'String'}[]`;
+  if (value.t === 4) return 'System.Collections.Generic.List';
+  if (value.t === 5) return 'System.Collections.Generic.Dictionary';
   return String(value.v | 0);
 }
 
 function truthy(value: Val): boolean {
   if (value.t === 1) return value.v.length > 0;
   if (value.t === 3) return value.v.items.length > 0;
+  if (value.t === 4) return value.v.items.length > 0;
+  if (value.t === 5) return value.v.entries.length > 0;
   return value.v !== 0;
 }
 
@@ -628,7 +669,7 @@ export class BytecodeVm {
         const b = this.pop();
         const a = this.pop();
         let equal: boolean;
-        if (a.t === 3 || b.t === 3) equal = a.t === 3 && b.t === 3 && a.v === b.v;
+        if (a.t >= 3 || b.t >= 3) equal = a.t === b.t && a.v === b.v;
         else if (a.t === 1 || b.t === 1) equal = toStr(a) === toStr(b);
         else equal = toNum(a) === toNum(b);
         this.push(bool(opcode === Op.EQ ? equal : !equal));
@@ -780,6 +821,10 @@ export class BytecodeVm {
           this.push(int(value.v.length));
         } else if (value.t === 3) {
           this.push(int(value.v.items.length));
+        } else if (value.t === 4) {
+          this.push(int(value.v.items.length));
+        } else if (value.t === 5) {
+          this.push(int(value.v.entries.length));
         } else {
           this.warn('wrong value type -> 0');
           this.push(int(0));
@@ -1095,6 +1140,196 @@ export class BytecodeVm {
         } else {
           for (let i = 0; i < n; i++) dest.v.items[destIndex + i] = source.v.items[sourceIndex + i];
         }
+        return;
+      }
+
+      case Op.NEWLIST: {
+        const element = kindFromTag(this.fetch16());
+        const capacity = toNum(this.pop());
+        if (capacity < 0 || capacity > 7000) {
+          this.fail('list allocation error');
+          return;
+        }
+        this.push({ t: 4, v: { kind: 'list', element, items: [] } });
+        return;
+      }
+      case Op.LADD: {
+        const value = this.pop();
+        const list = this.pop();
+        if (list.t !== 4) {
+          this.fail('Add on a non-list value');
+          return;
+        }
+        list.v.items.push(value);
+        return;
+      }
+      case Op.LGET: {
+        const index = toNum(this.pop());
+        const list = this.pop();
+        if (list.t !== 4) {
+          this.fail('list index on a non-list value');
+          return;
+        }
+        if (index < 0 || index >= list.v.items.length) {
+          this.fail('list index out of bounds');
+          return;
+        }
+        this.push(list.v.items[index]);
+        return;
+      }
+      case Op.LSET: {
+        const value = this.pop();
+        const index = toNum(this.pop());
+        const list = this.pop();
+        if (list.t !== 4) {
+          this.fail('list assignment on a non-list value');
+          return;
+        }
+        if (index < 0 || index >= list.v.items.length) {
+          this.fail('list index out of bounds');
+          return;
+        }
+        list.v.items[index] = value;
+        this.push(value);
+        return;
+      }
+      case Op.LCOUNT: {
+        const list = this.pop();
+        if (list.t !== 4) {
+          this.fail('Count on a non-list value');
+          return;
+        }
+        this.push(int(list.v.items.length));
+        return;
+      }
+      case Op.LREMOVEAT: {
+        const index = toNum(this.pop());
+        const list = this.pop();
+        if (list.t !== 4) {
+          this.fail('RemoveAt on a non-list value');
+          return;
+        }
+        if (index < 0 || index >= list.v.items.length) {
+          this.fail('list index out of bounds');
+          return;
+        }
+        list.v.items.splice(index, 1);
+        return;
+      }
+      case Op.LREMOVEGET: {
+        const index = toNum(this.pop());
+        const list = this.pop();
+        if (list.t !== 4) {
+          this.fail('Dequeue/Pop on a non-list value');
+          return;
+        }
+        if (index < 0 || index >= list.v.items.length) {
+          this.fail('list index out of bounds');
+          return;
+        }
+        this.push(list.v.items.splice(index, 1)[0]);
+        return;
+      }
+      case Op.LCLEAR: {
+        const list = this.pop();
+        if (list.t !== 4) {
+          this.fail('Clear on a non-list value');
+          return;
+        }
+        list.v.items.length = 0;
+        return;
+      }
+      case Op.LINDEXOF:
+      case Op.LCONTAINS: {
+        const needle = this.pop();
+        const list = this.pop();
+        if (list.t !== 4) {
+          this.fail('collection search on a non-list value');
+          return;
+        }
+        const index = list.v.items.findIndex((value) => valuesEqual(value, needle));
+        this.push(opcode === Op.LCONTAINS ? bool(index >= 0) : int(index));
+        return;
+      }
+      case Op.NEWDICT: {
+        const tags = this.fetch16();
+        const keyKind = kindFromTag(tags & 0xff);
+        const valueKind = kindFromTag((tags >> 8) & 0xff);
+        const capacity = toNum(this.pop());
+        if (capacity < 0 || capacity > 7000) {
+          this.fail('dictionary allocation error');
+          return;
+        }
+        this.push({ t: 5, v: { kind: 'dict', keyKind, valueKind, entries: [] } });
+        return;
+      }
+      case Op.DSET: {
+        const value = this.pop();
+        const key = this.pop();
+        const dict = this.pop();
+        if (dict.t !== 5) {
+          this.fail('dictionary assignment on a non-dictionary value');
+          return;
+        }
+        const found = dict.v.entries.find((entry) => valuesEqual(entry.key, key));
+        if (found) found.value = value;
+        else dict.v.entries.push({ key, value });
+        this.push(value);
+        return;
+      }
+      case Op.DGET: {
+        const key = this.pop();
+        const dict = this.pop();
+        if (dict.t !== 5) {
+          this.fail('dictionary index on a non-dictionary value');
+          return;
+        }
+        const found = dict.v.entries.find((entry) => valuesEqual(entry.key, key));
+        if (!found) {
+          this.fail('dictionary key not found');
+          return;
+        }
+        this.push(found.value);
+        return;
+      }
+      case Op.DCOUNT: {
+        const dict = this.pop();
+        if (dict.t !== 5) {
+          this.fail('Count on a non-dictionary value');
+          return;
+        }
+        this.push(int(dict.v.entries.length));
+        return;
+      }
+      case Op.DREMOVE: {
+        const key = this.pop();
+        const dict = this.pop();
+        if (dict.t !== 5) {
+          this.fail('Remove on a non-dictionary value');
+          return;
+        }
+        const index = dict.v.entries.findIndex((entry) => valuesEqual(entry.key, key));
+        if (index >= 0) dict.v.entries.splice(index, 1);
+        this.push(bool(index >= 0));
+        return;
+      }
+      case Op.DCLEAR: {
+        const dict = this.pop();
+        if (dict.t !== 5) {
+          this.fail('Clear on a non-dictionary value');
+          return;
+        }
+        dict.v.entries.length = 0;
+        return;
+      }
+      case Op.DCONTAINSKEY: {
+        const key = this.pop();
+        const dict = this.pop();
+        if (dict.t !== 5) {
+          this.fail('ContainsKey on a non-dictionary value');
+          return;
+        }
+        this.push(bool(dict.v.entries.some((entry) => valuesEqual(entry.key, key))));
         return;
       }
 

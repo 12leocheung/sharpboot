@@ -2,9 +2,18 @@ import type { Diagnostic } from './types.ts';
 import { tokenize } from './lexer.ts';
 import type { Token } from './lexer.ts';
 
+export type CollectionElement = 'int' | 'string' | 'bool';
+
+export type CollectionTypeName =
+  | `List<${CollectionElement}>`
+  | `Queue<${CollectionElement}>`
+  | `Stack<${CollectionElement}>`
+  | `Dictionary<${CollectionElement},${CollectionElement}>`;
+
 export type TypeName =
   | 'int' | 'double' | 'string' | 'bool' | 'char' | 'void' | 'var'
-  | 'int[]' | 'string[]' | 'bool[]';
+  | 'int[]' | 'string[]' | 'bool[]'
+  | CollectionTypeName;
 
 export interface Param {
   name: string;
@@ -116,6 +125,28 @@ const TYPE_WORDS: Record<string, TypeName> = {
   Void: 'void',
   var: 'var',
 };
+
+const COLLECTION_BASES = new Set(['List', 'Queue', 'Stack', 'Dictionary']);
+
+function collectionElement(type: TypeName): CollectionElement | null {
+  if (type === 'int' || type === 'double') return 'int';
+  if (type === 'string' || type === 'char') return 'string';
+  if (type === 'bool') return 'bool';
+  return null;
+}
+
+function makeCollectionType(base: string, args: TypeName[]): TypeName | null {
+  if (base === 'Dictionary' && args.length === 2) {
+    const key = collectionElement(args[0]);
+    const value = collectionElement(args[1]);
+    if (key && value) return `Dictionary<${key},${value}>`;
+    return null;
+  }
+  if (base !== 'List' && base !== 'Queue' && base !== 'Stack') return null;
+  if (args.length !== 1) return null;
+  const element = collectionElement(args[0]);
+  return element ? `${base}<${element}>` : null;
+}
 
 const MODIFIERS = new Set([
   'public',
@@ -435,29 +466,58 @@ class Parser {
     return { name, returnType, params, body, line };
   }
 
-  private parseType(): TypeName {
+  private parseType(allowArray = true): TypeName {
     const tok = this.peek();
     if (tok.kind !== 'ident') {
       this.fail(`Expected a type but found ${describe(tok)}`);
     }
     this.next();
-    if (this.at('[')) {
+    let rawName = tok.value;
+    while (this.at('.')) {
+      this.next();
+      rawName += '.' + this.expectIdent().value;
+    }
+    const shortName = rawName.slice(rawName.lastIndexOf('.') + 1);
+
+    if (this.at('<')) {
+      if (!COLLECTION_BASES.has(shortName)) {
+        this.fail(`Generic type '${rawName}' is not supported`, 'Use List<T>, Queue<T>, Stack<T> or Dictionary<K,V>.');
+      }
+      this.next();
+      const args: TypeName[] = [];
+      do {
+        args.push(this.parseType(false));
+      } while (this.eat(','));
+      this.expect('>');
+      const collection = makeCollectionType(shortName, args);
+      if (!collection) {
+        this.fail(
+          `Unsupported type arguments for '${shortName}'`,
+          shortName === 'Dictionary' ? 'Dictionary keys and values must be int, string or bool.' : 'Collection elements must be int, string or bool.',
+        );
+      }
+      if (allowArray && this.at('[')) {
+        this.fail('Arrays of collections are not supported', 'Use a collection directly and grow it with Add.');
+      }
+      return collection;
+    }
+
+    const base = mapType(shortName);
+    if (!base) {
+      this.fail(`Type '${tok.value}' is not supported`, 'Supported types: int, double, string, bool, char and the generic collections.');
+    }
+    if (base === 'void' && rawName !== shortName) {
+      this.fail(`Type '${rawName}' is not supported`);
+    }
+    if (allowArray && this.at('[')) {
       this.next();
       this.expect(']');
-      const base = mapType(tok.value);
       if (base === 'int' || base === 'bool') return `${base}[]`;
       if (base === 'string' || base === 'char') return 'string[]';
       if (base === 'double') return 'int[]';
       this.fail(`Arrays of '${tok.value}' are not supported`, 'Use int[], double[], string[], bool[] or char[].');
     }
-    if (this.at('<')) {
-      this.fail('Generic types are not supported', 'Use plain int, double, string, bool or char values.');
-    }
-    const mapped = mapType(tok.value);
-    if (!mapped) {
-      this.fail(`Type '${tok.value}' is not supported`, 'Supported types: int, double, string, bool, char.');
-    }
-    return mapped;
+    return base;
   }
 
   private skipAttributes(): void {
@@ -609,18 +669,49 @@ class Parser {
 
   private isLocalDeclaration(): boolean {
     if (this.at('const')) return true;
-    const tok = this.peek();
-    if (tok.kind !== 'ident' || mapType(tok.value) === null) return false;
-    let offset = 1;
-    if (this.peek(offset).kind === 'op' && this.peek(offset).value === '[') {
-      offset++;
-      if (!(this.peek(offset).kind === 'op' && this.peek(offset).value === ']')) return false;
-      offset++;
-    }
+    const offset = this.scanType(0);
+    if (offset === null) return false;
     const nameTok = this.peek(offset);
     if (nameTok.kind !== 'ident') return false;
     const after = this.peek(offset + 1);
     return after.kind === 'op' && ['=', ';', ',', ')'].includes(after.value);
+  }
+
+  /** Look ahead over a scalar, array or generic type. Returns the relative token offset after it. */
+  private scanType(start: number): number | null {
+    const first = this.peek(start);
+    if (first.kind !== 'ident') return null;
+    let offset = start + 1;
+    let base = first.value;
+    while (this.peek(offset).kind === 'op' && this.peek(offset).value === '.') {
+      offset++;
+      const part = this.peek(offset);
+      if (part.kind !== 'ident') return null;
+      base = part.value;
+      offset++;
+    }
+    if (this.peek(offset).kind === 'op' && this.peek(offset).value === '<') {
+      if (!COLLECTION_BASES.has(base)) return null;
+      offset++;
+      let depth = 1;
+      while (depth > 0) {
+        const tok = this.peek(offset);
+        if (tok.kind === 'eof') return null;
+        if (tok.kind === 'op' && tok.value === '<') depth++;
+        else if (tok.kind === 'op' && tok.value === '>') depth--;
+        else if (tok.kind === 'op' && tok.value === '>>') depth -= 2;
+        offset++;
+      }
+      if (depth < 0) return null;
+    } else if (mapType(base) === null) {
+      return null;
+    }
+    if (this.peek(offset).kind === 'op' && this.peek(offset).value === '[') {
+      offset++;
+      if (!(this.peek(offset).kind === 'op' && this.peek(offset).value === ']')) return null;
+      offset++;
+    }
+    return offset;
   }
 
   private parseLocalDeclaration(): Stmt {
@@ -797,14 +888,10 @@ class Parser {
       }
       if (tok.value === 'new') {
         this.next();
-        const baseTok = this.peek();
-        const base = baseTok.kind === 'ident' ? mapType(baseTok.value) : null;
-        if (!base) {
-          this.fail('Expected int, string or bool after new');
-        }
-        this.next();
+        const typeName = this.parseType(false);
         if (this.at('[')) {
           this.next();
+          const base = typeName;
           if (this.eat(']')) {
             this.expect('{');
             const items: Expr[] = [];
@@ -828,8 +915,8 @@ class Parser {
           }
           return { kind: 'newarray', elementType, size, line: tok.line };
         }
-        if (base !== 'string') {
-          this.fail('Only new string(...) and new int[n] are supported');
+        if (!this.at('(')) {
+          this.fail(`Expected '(' after new ${typeName}`);
         }
         this.expect('(');
         const args: Expr[] = [];
@@ -839,7 +926,7 @@ class Parser {
           } while (this.eat(','));
         }
         this.expect(')');
-        return { kind: 'new', typeName: base, args, line: tok.line };
+        return { kind: 'new', typeName, args, line: tok.line };
       }
       if (tok.value === 'this' || tok.value === 'base') {
         this.fail("'this' and 'base' are not supported", 'All methods are treated as static.');

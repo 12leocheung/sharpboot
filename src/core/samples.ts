@@ -167,6 +167,51 @@ class Program
 `,
   },
   {
+    id: 'collections',
+    label: 'Collections',
+    hint: 'List<T>, Dictionary<K,V>, Queue<T> and Stack<T>',
+    filename: 'collections.cs',
+    source: `using System;
+using System.Collections.Generic;
+
+class Program
+{
+    static void Main()
+    {
+        List<string> names = new List<string>();
+        names.Add("Ada");
+        names.Add("Grace");
+        names.Add("Linus");
+        names.RemoveAt(1);
+        Console.WriteLine("names=" + names.Count + " " + names[1]);
+
+        Dictionary<string,int> ages = new Dictionary<string,int>();
+        ages["Ada"] = 36;
+        ages["Linus"] = 54;
+        ages["Ada"] = ages["Ada"] + 1;
+        Console.WriteLine("Ada=" + ages["Ada"] + " count=" + ages.Count);
+        Console.WriteLine("has=" + ages.ContainsKey("Linus"));
+
+        Queue<int> queue = new Queue<int>();
+        queue.Enqueue(1);
+        queue.Enqueue(2);
+        Console.WriteLine("queue=" + queue.Dequeue() + "," + queue.Peek());
+
+        Stack<int> stack = new Stack<int>();
+        stack.Push(10);
+        stack.Push(20);
+        Console.WriteLine("stack=" + stack.Pop() + "," + stack.Peek());
+
+        foreach (string name in names)
+        {
+            Console.Write(name + " ");
+        }
+        Console.WriteLine("");
+    }
+}
+`,
+  },
+  {
     id: 'fizzbuzz',
     label: 'FizzBuzz',
     hint: 'if/else chains and modulo arithmetic',
